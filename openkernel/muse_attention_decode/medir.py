@@ -68,10 +68,11 @@ def main():
     p.add_argument("carpeta")
     p.add_argument("--repeticiones", type=int, default=50)
     p.add_argument("--solo", default="", help="solo las cargas que contengan este texto, p. ej. 'decode 32'")
+    p.add_argument("--archivo", default="submission.py", help="la version a medir, p. ej. submission_v4.py")
     a = p.parse_args()
     sys.path.insert(0, a.carpeta)
     ref = _modulo("reference", os.path.join(a.carpeta, "reference.py"))
-    sub = _modulo("submission", os.path.join(AQUI, "submission.py"))
+    sub = _modulo("submission", os.path.join(AQUI, a.archivo))
     print(f"GPU: {torch.cuda.get_device_name()}")
     cargas = {}
     for f in _formas(a.carpeta):

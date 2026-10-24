@@ -51,6 +51,18 @@ y Linux; en Windows (o en Colab) usa [`okc_win.py`](okc_win.py), un cliente de s
 `python okc_win.py login`, `check submission.py`, `submit submission.py`, `status <job>`, `leaderboard`. Al enviar, el código queda bajo
 Apache 2.0, la misma licencia de este repositorio.
 
+### Versiones
+
+| archivo | qué tiene | juez (H200) |
+|---|---|---|
+| v1 (historia de git) | dos kernels, ~2 programas por SM | 0.87× |
+| v2 (historia de git) | ~16 programas por SM, bloques de 128, tabla de páginas pedida antes | 1.19× |
+| `submission.py` (v3) | un programa por par de cabezas kv (filas del caché completas) | por medir |
+| `submission_v4.py` | v3 + planificador por longitudes reales + organizador de memoria (doble búfer, evict_first, configuración por forma medida con ptxas) | por medir |
+
+`python muse_attention_decode/compilar_sm90.py --archivo submission_v4.py` compila para la H200 sin GPU y reporta
+registros, derrames, memoria compartida y programas por SM de cada kernel.
+
 ### Qué falta probar para que sea más rápido
 
 1. Afinar en la H200 `BLOQUE_N`, `num_warps`, `num_stages` y el número de pedazos (ahora apunta a unos dos programas

@@ -2,6 +2,7 @@
 
     python probar_local.py <carpeta de okc init>          # en GPU
     TRITON_INTERPRET=1 python probar_local.py <carpeta>    # en CPU, con el interprete de Triton (lento)
+    python probar_local.py <carpeta> --archivo submission_v4.py   # otra version
 
 La carpeta es la que escribe `okc init muse_attention_decode <carpeta>` (reference.py y checks.py). Solo comprueba
 que el resultado sea correcto; la velocidad la mide `okc check`."""
@@ -40,7 +41,8 @@ def _modulo(nombre, archivo):
 def main(carpeta):
     sys.path.insert(0, carpeta)  # reference.py importa checks
     ref = _modulo("reference", os.path.join(carpeta, "reference.py"))
-    sub = _modulo("submission", os.path.join(AQUI, "submission.py"))
+    archivo = sys.argv[sys.argv.index("--archivo") + 1] if "--archivo" in sys.argv else "submission.py"
+    sub = _modulo("submission", os.path.join(AQUI, archivo))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if "--grandes" in sys.argv:  # los tamaños de las pruebas del juez (solo en GPU)
         CASOS.extend([dict(batch=2, ctx=100000, heads="tp8", layer="full", q_len=8, page=1),
