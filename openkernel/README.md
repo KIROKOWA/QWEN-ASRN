@@ -40,6 +40,7 @@ el caché. No sincroniza con la CPU ni ramifica sobre valores, así que se puede
 ```bash
 okc init muse_attention_decode oficial/        # reference.py, checks.py, baseline.py, TASK.md (no se suben al repo)
 python muse_attention_decode/probar_local.py oficial/ [--grandes]     # ¿correcto? (GPU; en CPU: TRITON_INTERPRET=1)
+python muse_attention_decode/compilar_sm90.py                          # ¿compila para la H200? (sin GPU)
 python muse_attention_decode/medir.py oficial/                         # µs por forma, con CUDA graphs y L2 frío
 okc check muse_attention_decode/submission.py                          # el juez, fuera del tablero
 okc submit muse_attention_decode/submission.py

@@ -54,7 +54,7 @@ class Inputs(TypedDict):
 
 RMS_EPS = 1e-5
 LOG2E = 1.4426950408889634
-VACIO = -1e30                 # maximo de una fila sin llaves validas: finito, para que 2^(m - m') no de NaN
+VACIO = tl.constexpr(-1e30)   # maximo de una fila sin llaves validas: finito, para que 2^(m - m') no de NaN
 ROPE_POSITIONS = 1 << 21      # como el RotaryEmbedding de SGLang (y baseline.py)
 BLOQUE_N = 64                 # llaves por vuelta de _parcial
 MAX_PEDAZOS = 128             # tope de pedazos por (peticion, cabeza kv): _final los junta de una vez
