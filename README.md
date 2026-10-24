@@ -63,3 +63,8 @@ Las pruebas comprueban:
 
 Todavía no se ha corrido con los pesos reales de Qwen 2.5 7B ni en una GPU: los números marcados "estimado" en el
 documento hay que medirlos ahí.
+
+## Open Kernel Challenge
+
+[`openkernel/`](openkernel/README.md) tiene entradas para el
+[Muse Spark Open Kernel Challenge](https://openkernelchallenge.dev/), con kernels de Triton inspirados en ASRN.
