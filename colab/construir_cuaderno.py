@@ -45,7 +45,7 @@ entrenar. Los cálculos de memoria y velocidad están en `docs/CALCULOS.md` del 
 
 | qué | cuándo | cómo |
 |---|---|---|
-| **nada** | si los repositorios `KIROKOWA/ASRN` y `KIROKOWA/qwen-asrn` son públicos y usas `FUENTE = 'pg19'` o `'wikitext'` | el cuaderno descarga el código, Qwen (15 GB) y los textos |
+| **nada** | si los repositorios `KIROKOWA/ASRN` y `KIROKOWA/qwen-asrn` son públicos. Con `FUENTE = 'pg19'` (lo que viene por defecto) los textos se descargan solos de HuggingFace: unos 25 M de piezas de libros de PG-19. Si no abre, usa wikitext-103 y después fineweb-edu | el cuaderno descarga el código, Qwen (15 GB) y los textos |
 | ZIP de `KIROKOWA/ASRN` (rama `main`) y ZIP de `KIROKOWA/qwen-asrn` (rama `claude/zealous-knuth-t4nhi3`) | si son **privados**: el cuaderno no puede clonarlos y te los pide | en GitHub: elige la rama → botón verde **Code → Download ZIP**; súbelos cuando aparezca el botón |
 | tus textos `.txt` | con `FUENTE = 'texto'` | ponlos en `Mi unidad/qwen_asrn/datos/` (o súbelos cuando te los pida) |
 | `train.u32` y `val.u32` | con `FUENTE = 'piezas'` (ya tokenizados) | en `Mi unidad/qwen_asrn/datos/`: piezas del tokenizador de Qwen 2.5, enteros de 32 bits crudos, `<\|endoftext\|>` (151643) entre documentos |
@@ -73,8 +73,10 @@ REPO_ASRN, RAMA_ASRN = 'https://github.com/KIROKOWA/ASRN.git', 'main'
 REPO_QWEN_ASRN, RAMA_QWEN_ASRN = 'https://github.com/KIROKOWA/qwen-asrn.git', 'claude/zealous-knuth-t4nhi3'
 CARPETA_DRIVE = 'qwen_asrn'        # en Mi unidad: datos, pesos y registro (sobreviven a una desconexion)
 
-FUENTE = 'pg19'                    # 'pg19' libros largos (lo mejor para ASRN: citas lejanas) | 'wikitext' |
-                                   # 'texto' tus .txt | 'piezas' tus train.u32 / val.u32 ya tokenizados
+FUENTE = 'pg19'                    # se descarga sola de HuggingFace (no hay que subir nada):
+                                   #   'pg19' libros largos de Project Gutenberg (lo mejor para ASRN: citas lejanas;
+                                   #          si no abre, wikitext-103 y luego fineweb-edu) | 'wikitext' | 'fineweb'
+                                   # o tus propios datos: 'texto' tus .txt | 'piezas' tus train.u32 / val.u32
 MAX_PIEZAS = 25_000_000            # piezas de entrenamiento a tokenizar (pg19 / wikitext / texto)
 PIEZAS_VALIDACION = 1_000_000
 
@@ -213,23 +215,38 @@ def _textos():
             parrafo = ' '.join(rnd.choice(palabras) for _ in range(60))
             yield parrafo + ' ' + ' '.join(rnd.choice(palabras) for _ in range(200)) + ' ' + parrafo
     from datasets import load_dataset
+    # datasets publicos de HuggingFace, en orden: si uno no abre, se usa el siguiente
+    candidatos = {
+        'pg19': [('emozilla/pg19', None), ('deepmind/pg19', None)],
+        'wikitext': [('Salesforce/wikitext', 'wikitext-103-raw-v1')],
+        'fineweb': [('HuggingFaceFW/fineweb-edu', 'sample-10BT')],
+    }
+    orden = {'pg19': ['pg19', 'wikitext', 'fineweb'], 'wikitext': ['wikitext', 'fineweb'], 'fineweb': ['fineweb']}
     fuente = FUENTE
-    if fuente == 'pg19':
-        try:
-            libros = load_dataset('emozilla/pg19', split='train', streaming=True)
-        except Exception as e:                                  # noqa: BLE001
-            print('No se pudo abrir pg19 (', e, '): uso wikitext-103')
-            fuente = 'wikitext'
-        else:
-            for fila in libros:
-                yield fila['text']
-    if fuente == 'wikitext':                                   # filas = lineas: se juntan en trozos de ~100 KB
-        trozo = []
-        for fila in load_dataset('Salesforce/wikitext', 'wikitext-103-raw-v1', split='train', streaming=True):
-            trozo.append(fila['text'])
-            if sum(map(len, trozo)) > 100_000:
-                yield ''.join(trozo)
-                trozo = []
+    if fuente in orden:
+        for f_ in orden[fuente]:
+            for nombre, config in candidatos[f_]:
+                try:
+                    filas = iter(load_dataset(nombre, config, split='train', streaming=True))
+                    primera = next(filas)
+                except Exception as e:                          # noqa: BLE001
+                    print(f'No se pudo abrir {nombre}: {type(e).__name__}: {str(e)[:200]}')
+                    continue
+                print(f'Textos de {nombre}' + (f' ({config})' if config else ''))
+                if f_ == 'wikitext':                           # filas = lineas: se juntan en trozos de ~100 KB
+                    trozo, n = [primera['text']], 0
+                    for fila in filas:
+                        trozo.append(fila['text'])
+                        n += len(fila['text'])
+                        if n > 100_000:
+                            yield ''.join(trozo)
+                            trozo, n = [], 0
+                else:
+                    yield primera['text']
+                    for fila in filas:
+                        yield fila['text']
+                return
+        raise RuntimeError('No se pudo abrir ningun dataset de HuggingFace (¿sin red?). Usa FUENTE = "texto"')
     elif fuente == 'texto':
         archivos = sorted(glob.glob(os.path.join(DATOS, '*.txt')))
         if not archivos and EN_COLAB:
@@ -244,7 +261,7 @@ def _textos():
         for a in archivos:
             with open(a, encoding='utf-8', errors='replace') as f:
                 yield f.read()
-    elif fuente != 'pg19':
+    else:
         raise ValueError(f'FUENTE desconocida: {FUENTE!r}')
 
 def _tokenizar(objetivo):
