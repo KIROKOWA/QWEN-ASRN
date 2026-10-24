@@ -67,7 +67,10 @@ def main():
         g = hq // hkv
         bm = max(16, triton.next_power_of_2(largo * g))
         # Lo que kernel_fn elegiria para esta forma.
-        if hasattr(sub, "CONFIG"):
+        etapas = 1
+        if hasattr(sub, "CONFIG") and (largo, not deslizante) in sub.CONFIG:
+            bn, par, warps, etapas, _ = sub.CONFIG[(largo, not deslizante)]
+        elif hasattr(sub, "CONFIG"):
             bn, par, warps, _ = sub.CONFIG.get(largo, sub.CONFIG[8])
         else:
             bn, par, warps = (64 if deslizante else 128), (2 if hkv % 2 == 0 else 1), (8 if bm > 16 else 4)
@@ -75,7 +78,7 @@ def main():
             par = 1
         constantes = dict(B=4, BB=4, HQ=hq, HKV=hkv, L=largo, G=g, PAGINA=pagina,
                           VENTANA=2048 if deslizante else 0, CON_ROPE=deslizante, BLOQUE_M=bm, BLOQUE_N=bn, PAR=par,
-                          EN_CPU=False, BLOQUE_L=triton.next_power_of_2(largo))
+                          ETAPAS=etapas, EN_CPU=False, BLOQUE_L=triton.next_power_of_2(largo))
         rope = "*fp32" if deslizante else "*bf16"
         r, dr, sh = compilar(sub._parcial, constantes, dict(num_warps=warps, num_stages=1), rope)
         lineas = [f"_parcial {r:3d} regs {dr:4d} B derramados {sh:6d} B compartida -> {por_sm(r, sh, warps)}/SM"]

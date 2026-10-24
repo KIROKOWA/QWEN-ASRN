@@ -57,8 +57,9 @@ Apache 2.0, la misma licencia de este repositorio.
 |---|---|---|
 | v1 (historia de git) | dos kernels, ~2 programas por SM | 0.87× |
 | v2 (historia de git) | ~16 programas por SM, bloques de 128, tabla de páginas pedida antes | 1.19× |
-| `submission.py` (v3) | un programa por par de cabezas kv (filas del caché completas) | por medir |
-| `submission_v4.py` | v3 + planificador por longitudes reales + organizador de memoria (doble búfer, evict_first, configuración por forma medida con ptxas) | por medir |
+| `submission.py` (v3) | un programa por par de cabezas kv (filas del caché completas); en verify solo 1 programa por SM | 0.83× |
+| `submission_v4.py` | v3 + planificador por longitudes reales + doble búfer en registros, evict_first | por medir |
+| `submission_v5.py` | v2 + planificador + anillo asíncrono de 3–4 etapas en memoria compartida, configuración por forma medida con ptxas | por medir |
 
 `python muse_attention_decode/compilar_sm90.py --archivo submission_v4.py` compila para la H200 sin GPU y reporta
 registros, derrames, memoria compartida y programas por SM de cada kernel.
