@@ -108,11 +108,25 @@ def status(job, carpeta="."):
     salida = os.path.join(carpeta, "profiles", f"submission.{job}.json")
     with open(salida, "w", encoding="utf-8") as f:
         json.dump(r, f, indent=1, ensure_ascii=False)
-    resultado = {k: v for k, v in r.items() if k not in ("log_tail", "code", "profile")}
-    print(json.dumps(resultado, indent=1, ensure_ascii=False)[:6000])
+    _resumen(r)
     if r.get("log_tail"):
         print("--- lo que imprimio la corrida (final) ---\n" + r["log_tail"][-3000:])
     print(f"(todo el resultado en {salida})")
+
+
+def _resumen(r):
+    """Una linea por prueba y por forma medida, y lo demas del resultado: sin cortar lo que importa."""
+    res = r.get("result") or {}
+    print(f"corrida {r.get('id')} ({r.get('mode')}): {r.get('status')}, passed={res.get('passed')}, "
+          f"error={res.get('error')}, banderas={res.get('flags')}, revision={res.get('checks')}")
+    for rec in res.get("records", []):
+        if rec.get("event") == "test":
+            print(f"  prueba {rec.get('index'):>2} {rec.get('status'):5s} {rec.get('case')}  {rec.get('message', '')[:300]}")
+        else:
+            print("  " + json.dumps(rec, ensure_ascii=False)[:800])
+    resto = {k: v for k, v in res.items() if k not in ("records", "machine", "checks", "passed", "error", "flags")}
+    if resto:
+        print(json.dumps(resto, indent=1, ensure_ascii=False)[:4000])
 
 
 def main(args):
