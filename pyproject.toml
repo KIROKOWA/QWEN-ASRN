@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-asrn"
+version = "0.1"
+description = "Qwen 2.5 congelado (bf16) con capas ASRN (CapaASRNEstable, fp32) injertadas cada 2 bloques"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Alexis Calvario" }]
+requires-python = ">=3.11"
+dependencies = ["torch>=2.9", "transformers>=4.45", "safetensors", "asrn @ git+https://github.com/KIROKOWA/ASRN.git"]
+
+[tool.setuptools]
+packages = ["qwen_asrn"]
