@@ -45,7 +45,9 @@ okc check muse_attention_decode/submission.py                          # el juez
 okc submit muse_attention_decode/submission.py
 ```
 
-`okc login` lo tiene que correr una persona: acepta las reglas y los términos. Al enviar, el código queda bajo
+`okc login` lo tiene que correr una persona: acepta las reglas y los términos. El reto solo publica `okc` para macOS
+y Linux; en Windows (o en Colab) usa [`okc_win.py`](okc_win.py), un cliente de su API HTTP que solo necesita Python:
+`python okc_win.py login`, `check submission.py`, `submit submission.py`, `status <job>`, `leaderboard`. Al enviar, el código queda bajo
 Apache 2.0, la misma licencia de este repositorio.
 
 ### Qué falta probar para que sea más rápido
