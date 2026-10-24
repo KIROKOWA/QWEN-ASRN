@@ -3,3 +3,7 @@ __pycache__/
 *.u32
 *.i32
 .pytest_cache/
+
+# Open Kernel Challenge: lo que escribe okc (archivos oficiales y perfiles)
+openkernel/**/oficial/
+openkernel/**/profiles/
