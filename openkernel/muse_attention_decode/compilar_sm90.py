@@ -30,12 +30,12 @@ for (hq, hkv), L, pagina, deslizante in itertools.product([(16, 2), (128, 16)], 
                    escala_log2='fp32')
     k1 = compilar(sub._parcial, dict(comunes, TABLA='*i32', paso_tabla='i32', chunk='i32'),
                   dict(HQ=hq, HKV=hkv, L=L, G=g, PAGINA=pagina, VENTANA=2048 if deslizante else 0,
-                       CON_ROPE=deslizante, BLOQUE_M=bm, BLOQUE_N=64 if deslizante else 128, EN_CPU=False),
-                  dict(num_warps=4, num_stages=2))
-    for bs in (1, 32, 64):
+                       CON_ROPE=deslizante, BLOQUE_M=bm, BLOQUE_N=64 if deslizante else 128, PAR=2, EN_CPU=False),
+                  dict(num_warps=8 if bm > 16 else 4, num_stages=2))
+    for bs in (1, 32, 128):
         k2 = compilar(sub._final, dict(comunes, LOC='*i64', VS='*fp32', OUT='*bf16'),
                       dict(HQ=hq, HKV=hkv, L=L, G=g, CON_ROPE=deslizante, BLOQUE_M=bm, BLOQUE_S=bs, BLOQUE_L=L),
-                      dict(num_warps=4))
+                      dict(num_warps=8 if bs > 32 else 4))
     n += 1
     print(f"ok hq={hq} L={L} pagina={pagina} {'deslizante' if deslizante else 'completa'}: "
           f"_parcial {k1.metadata.shared} B shared, {k1.n_regs if hasattr(k1,'n_regs') else '?'} regs", flush=True)
