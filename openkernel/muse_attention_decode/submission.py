@@ -56,8 +56,8 @@ RMS_EPS = 1e-5
 LOG2E = 1.4426950408889634
 VACIO = tl.constexpr(-1e30)   # maximo de una fila sin llaves validas: finito, para que 2^(m - m') no de NaN
 ROPE_POSITIONS = 1 << 21      # como el RotaryEmbedding de SGLang (y baseline.py)
-BLOQUE_N = 64                 # llaves por vuelta de _parcial
-MAX_PEDAZOS = 128             # tope de pedazos por (peticion, cabeza kv): _final los junta de una vez
+PROGRAMAS_POR_SM = 16         # _parcial: muchos programas en vuelo, para tapar la espera de las lecturas sueltas
+BLOQUE_S = 64                 # _final junta los pedazos de a tantos
 _ROPE = {}
 _SMS = {}
 
@@ -108,6 +108,15 @@ def _norma_rope(base, pos, ROPE, escala, CON_ROPE: tl.constexpr):
 
 
 @triton.jit
+def _filas(TABLA, b, paso_tabla, t, fin, PAGINA: tl.constexpr):
+    """Filas del cache (int64) de las posiciones t de la peticion b; 0 en las que no llegan a fin."""
+    ok = t < fin
+    if PAGINA == 1:
+        return tl.load(TABLA + b * paso_tabla + t, mask=ok, other=0).to(tl.int64)
+    return tl.load(TABLA + b * paso_tabla + t // PAGINA, mask=ok, other=0).to(tl.int64) * PAGINA + t % PAGINA
+
+
+@triton.jit
 def _parcial(QKV, SEQ, TABLA, KC, VC, KS, ROPE, MP, LP, AP, paso_qkv, paso_tabla, chunk, n_pedazos, qk_escala,
              escala_log2, HQ: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, G: tl.constexpr,
              PAGINA: tl.constexpr, VENTANA: tl.constexpr, CON_ROPE: tl.constexpr, BLOQUE_M: tl.constexpr,
@@ -139,13 +148,14 @@ def _parcial(QKV, SEQ, TABLA, KC, VC, KS, ROPE, MP, LP, AP, paso_qkv, paso_tabla
     m = tl.full([BLOQUE_M], VACIO, tl.float32)
     suma = tl.zeros([BLOQUE_M], tl.float32)
     acc = tl.zeros([BLOQUE_M, 64], tl.float32)
+    # La tabla de paginas de la vuelta siguiente se pide antes de leer las llaves de esta: asi la lectura de la tabla
+    # y la de las filas sueltas del cache que dependen de ella no se esperan una a la otra.
+    fila_sig = _filas(TABLA, b, paso_tabla, inicio + tl.arange(0, BLOQUE_N), fin, PAGINA)
     for t0 in range(inicio, fin, BLOQUE_N):
         t = t0 + tl.arange(0, BLOQUE_N)
         ok = t < fin
-        if PAGINA == 1:
-            fila_c = tl.load(TABLA + b * paso_tabla + t, mask=ok, other=0).to(tl.int64)
-        else:
-            fila_c = tl.load(TABLA + b * paso_tabla + t // PAGINA, mask=ok, other=0).to(tl.int64) * PAGINA + t % PAGINA
+        fila_c = fila_sig
+        fila_sig = _filas(TABLA, b, paso_tabla, t + BLOQUE_N, fin, PAGINA)
         off = fila_c[:, None] * (HKV * 64) + h * 64 + d[None, :]
         k = tl.load(KC + off, mask=ok[:, None], other=0.0).to(tl.bfloat16)
         v = tl.load(VC + off, mask=ok[:, None], other=0.0).to(tl.bfloat16)
@@ -169,15 +179,15 @@ def _parcial(QKV, SEQ, TABLA, KC, VC, KS, ROPE, MP, LP, AP, paso_qkv, paso_tabla
         m = m_nuevo
 
     donde = (bh * n_pedazos + s) * BLOQUE_M + filas
-    tl.store(MP + donde, m)
-    tl.store(LP + donde, suma)
-    tl.store(AP + donde[:, None] * 64 + d[None, :], acc)
+    tl.store(MP + donde, m, mask=fila_ok)
+    tl.store(LP + donde, suma, mask=fila_ok)
+    tl.store(AP + donde[:, None] * 64 + d[None, :], acc, mask=fila_ok[:, None])
 
 
 @triton.jit
 def _final(QKV, SEQ, LOC, KC, VC, KS, VS, ROPE, MP, LP, AP, OUT, paso_qkv, n_pedazos, qk_escala, escala_log2,
            HQ: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, G: tl.constexpr, CON_ROPE: tl.constexpr,
-           BLOQUE_M: tl.constexpr, BLOQUE_S: tl.constexpr):
+           BLOQUE_M: tl.constexpr, BLOQUE_S: tl.constexpr, BLOQUE_L: tl.constexpr):
     pid = tl.program_id(0)
     bh = pid // (L * G)
     r = pid % (L * G)
@@ -190,39 +200,45 @@ def _final(QKV, SEQ, LOC, KC, VC, KS, VS, ROPE, MP, LP, AP, OUT, paso_qkv, n_ped
     uno = tl.arange(0, 1)
     ks, vs = tl.load(KS), tl.load(VS)
 
-    # Juntar los pedazos de _parcial de una vez (composicion asociativa del softmax en linea).
-    sidx = tl.arange(0, BLOQUE_S)
-    hay = sidx < n_pedazos
-    donde = (bh * n_pedazos + sidx) * BLOQUE_M + r
-    ms = tl.load(MP + donde, mask=hay, other=VACIO)
-    m = tl.max(ms, 0)
-    w = tl.math.exp2(ms - m) * hay
-    suma = tl.sum(tl.load(LP + donde, mask=hay, other=0.0) * w, 0)
-    acc = tl.sum(tl.load(AP + donde[:, None] * 64 + d[None, :], mask=hay[:, None], other=0.0) * w[:, None], 0)
+    # Juntar los pedazos de _parcial de a BLOQUE_S (composicion asociativa del softmax en linea).
+    m = tl.max(tl.full([BLOQUE_S], VACIO, tl.float32), 0)
+    suma = tl.sum(tl.zeros([BLOQUE_S], tl.float32), 0)
+    acc = tl.zeros([64], tl.float32)
+    for s0 in range(0, n_pedazos, BLOQUE_S):
+        sidx = s0 + tl.arange(0, BLOQUE_S)
+        hay = sidx < n_pedazos
+        donde = (bh * n_pedazos + sidx) * BLOQUE_M + r
+        ms = tl.load(MP + donde, mask=hay, other=VACIO)
+        m_nuevo = tl.maximum(m, tl.max(ms, 0))
+        alfa = tl.math.exp2(m - m_nuevo)
+        w = tl.where(hay, tl.math.exp2(ms - m_nuevo), 0.0)
+        suma = suma * alfa + tl.sum(tl.load(LP + donde, mask=hay, other=0.0) * w, 0)
+        acc = acc * alfa + tl.sum(tl.load(AP + donde[:, None] * 64 + d[None, :], mask=hay[:, None], other=0.0)
+                                  * w[:, None], 0)
+        m = m_nuevo
 
     fila_q = QKV + (b * L + j).to(tl.int64) * paso_qkv + cabeza * 64 + uno
     q = tl.reshape(_norma_rope(fila_q, seq + j + uno, ROPE, qk_escala, CON_ROPE), (64,))
     q = q.to(tl.bfloat16).to(tl.float32)
     escribe = r == 0  # una fila por (peticion, cabeza kv) guarda las llaves y valores nuevos
 
-    # Las L piezas del bloque: cada fila j ve las i <= j (siempre dentro de la ventana, que es mucho mas larga).
-    for i in tl.static_range(L):
-        tok = (b * L + i).to(tl.int64)
-        fila_k = QKV + tok * paso_qkv + (HQ + h) * 64 + uno
-        k = tl.reshape(_norma_rope(fila_k, seq + i + uno, ROPE, 1.0, CON_ROPE), (64,))
-        k8 = _a_fp8(k / ks)
-        v8 = _a_fp8(tl.load(QKV + tok * paso_qkv + (HQ + HKV + h) * 64 + d).to(tl.float32) / vs)
-        destino = tl.load(LOC + tok) * (HKV * 64) + h * 64 + d
-        tl.store(KC + destino, k8, mask=escribe & (d < 64))
-        tl.store(VC + destino, v8, mask=escribe & (d < 64))
-        sc = tl.sum(q * k8.to(tl.float32), 0) * ks * escala_log2
-        sc = tl.where(i <= j, sc, float("-inf"))
-        m_nuevo = tl.maximum(m, sc)
-        alfa = tl.math.exp2(m - m_nuevo)
-        p = tl.math.exp2(sc - m_nuevo)
-        suma = suma * alfa + p
-        acc = acc * alfa + p * v8.to(tl.float32)
-        m = m_nuevo
+    # Las L piezas del bloque, todas a la vez: cada fila j ve las i <= j (siempre dentro de la ventana).
+    li = tl.arange(0, BLOQUE_L)
+    hay_l = li < L
+    i_c = tl.where(hay_l, li, 0)
+    tok = (b * L + i_c).to(tl.int64)
+    k8 = _a_fp8(_norma_rope(QKV + tok * paso_qkv + (HQ + h) * 64, seq + i_c, ROPE, 1.0, CON_ROPE) / ks)
+    v8 = _a_fp8(tl.load(QKV + tok[:, None] * paso_qkv + (HQ + HKV + h) * 64 + d[None, :]).to(tl.float32) / vs)
+    destino = tl.load(LOC + tok)[:, None] * (HKV * 64) + h * 64 + d[None, :]
+    tl.store(KC + destino, k8, mask=escribe & hay_l[:, None])
+    tl.store(VC + destino, v8, mask=escribe & hay_l[:, None])
+    sc = tl.sum(q[None, :] * k8.to(tl.float32), 1) * ks * escala_log2
+    sc = tl.where(hay_l & (li <= j), sc, float("-inf"))
+    m_nuevo = tl.maximum(m, tl.max(sc, 0))
+    alfa = tl.math.exp2(m - m_nuevo)
+    p = tl.math.exp2(sc - m_nuevo)
+    suma = suma * alfa + tl.sum(p, 0)
+    acc = acc * alfa + tl.sum(p[:, None] * v8.to(tl.float32), 0)
 
     o = acc / suma * vs
     o = o * tl.rsqrt(tl.sum(o * o, 0) / 64 + 1e-5)
@@ -246,11 +262,14 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     qk_escala = float(cfg["qk_scale_factor"])
     escala_log2 = float(cfg["sm_scale"]) * LOG2E
 
-    # Pedazos del contexto ya guardado, por la forma (no por los valores): unos dos programas por SM.
+    # Pedazos del contexto ya guardado, por la forma (no por los valores): unos PROGRAMAS_POR_SM programas por SM,
+    # de al menos dos vueltas de bloque_n llaves cada uno.
     max_llaves = ventana - 1 if ventana else tabla.shape[1] * pagina
+    bloque_n = 64 if max_llaves <= 4096 else 128
     n_bh = batch * hkv
-    n_pedazos = max(1, min(MAX_PEDAZOS, triton.cdiv(max_llaves, BLOQUE_N), triton.cdiv(2 * _n_sms(device), n_bh)))
-    chunk = triton.cdiv(triton.cdiv(max_llaves, n_pedazos), BLOQUE_N) * BLOQUE_N
+    n_pedazos = max(1, min(triton.cdiv(PROGRAMAS_POR_SM * _n_sms(device), n_bh),
+                           triton.cdiv(max_llaves, 2 * bloque_n)))
+    chunk = triton.cdiv(triton.cdiv(max_llaves, n_pedazos), bloque_n) * bloque_n
     n_pedazos = max(1, triton.cdiv(max_llaves, chunk))
     bloque_m = max(16, triton.next_power_of_2(largo * g))
 
@@ -264,10 +283,11 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         qkv, data["seq_lens"], tabla, k_cache, v_cache, data["k_scale"], rope, mp, lp, ap,
         qkv.stride(0), tabla.stride(0), chunk, n_pedazos, qk_escala, escala_log2,
         HQ=hq, HKV=hkv, L=largo, G=g, PAGINA=pagina, VENTANA=ventana, CON_ROPE=con_rope, BLOQUE_M=bloque_m,
-        BLOQUE_N=BLOQUE_N, EN_CPU=device.type == "cpu", num_warps=4, num_stages=2)
+        BLOQUE_N=bloque_n, EN_CPU=device.type == "cpu", num_warps=4, num_stages=2)
     _final[(n_bh * largo * g,)](
         qkv, data["seq_lens"], data["cache_loc"], k_cache, v_cache, data["k_scale"], data["v_scale"], rope,
         mp, lp, ap, out, qkv.stride(0), n_pedazos, qk_escala, escala_log2,
         HQ=hq, HKV=hkv, L=largo, G=g, CON_ROPE=con_rope, BLOQUE_M=bloque_m,
-        BLOQUE_S=triton.next_power_of_2(n_pedazos), num_warps=2)
+        BLOQUE_S=min(BLOQUE_S, triton.next_power_of_2(n_pedazos)), BLOQUE_L=triton.next_power_of_2(largo),
+        num_warps=4)
     return out
