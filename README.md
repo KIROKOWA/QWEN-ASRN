@@ -21,6 +21,12 @@ Los cálculos de VRAM y FLOPs, y por qué se eligió la opción A, están en [do
 pip install -r requirements.txt      # torch >= 2.9, transformers, asrn 1.0 (desde GitHub)
 ```
 
+## Entrenar en Colab
+
+Abre [`colab/qwen_asrn_colab.ipynb`](colab/qwen_asrn_colab.ipynb) en Colab, elige una A100 y ejecuta todo. Su primera
+celda explica qué subir y cuánto tarda. Lo genera `colab/construir_cuaderno.py`; con `--probar`, ese script lo ejecuta
+entero en CPU con un Qwen diminuto.
+
 ## Entrenar (A100 80 GB)
 
 ```bash

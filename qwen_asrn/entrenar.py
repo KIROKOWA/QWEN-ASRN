@@ -10,7 +10,8 @@ Por paso: `acumular` lotes de `lote` ventanas de `largo` piezas. AdamW (asrn.cre
 matrices) sobre los parametros de ASRN y nada mas; recorte dinamico del gradiente por grupos (asrn.RecorteDinamico)
 o recorte fijo; calentamiento + coseno (asrn.tasa_aprendizaje); un paso con perdida o norma no finita se salta. Antes
 del primer paso comprueba el arranque neutro (el injerto no cambia nada de Qwen, bit a bit) y se detiene si falla.
-Guarda solo los pesos de ASRN (fp32) mas el estado de AdamW, el paso y el azar.
+Guarda solo los pesos de ASRN (fp32) mas el estado de AdamW, el paso y el azar (para reanudar); el mejor en validacion
+(<archivo>.mejor.pt), solo los pesos.
 """
 import argparse
 import math
@@ -43,8 +44,8 @@ def _preparar(datos, V, largo, disp):
 
 
 @torch.no_grad()
-def evaluar(modelo, datos, largo, lote, max_lotes):
-    """Perdida media sobre ventanas seguidas desde el inicio de `datos`."""
+def evaluar(modelo, datos, largo, lote, max_lotes, sin_asrn=False):
+    """Perdida media sobre ventanas seguidas desde el inicio de `datos` (sin_asrn=True: la de Qwen solo)."""
     estaba = modelo.training
     modelo.eval()
     disp = modelo.qwen.model.embed_tokens.weight.device
@@ -56,7 +57,7 @@ def evaluar(modelo, datos, largo, lote, max_lotes):
                 break
             idx = (ini.unsqueeze(1) + torch.arange(largo + 1)).to(datos.device)
             w = datos[idx].to(disp).long()
-            total += float(modelo.perdida(w[:, :-1], w[:, 1:])) * w[:, 1:].numel()
+            total += float(modelo.perdida(w[:, :-1], w[:, 1:], sin_asrn=sin_asrn)) * w[:, 1:].numel()
             n += w[:, 1:].numel()
     finally:
         modelo.train(estaba)
@@ -95,8 +96,10 @@ def entrenar(modelo, datos, validacion=None, largo=4096, lote=1, acumular=16, pa
         if not ok:
             raise RuntimeError(f'el injerto cambia las activaciones de Qwen en el paso 0: {det}')
 
-    def guardar(archivo):
-        guardar_asrn(modelo, archivo, opt=opt.state_dict(), paso=paso, mejor=mejor, azar=g.get_state())
+    def guardar(archivo, para_reanudar=True):
+        """Con para_reanudar, tambien AdamW (2x los pesos), el paso y el azar; si no, solo los pesos de ASRN."""
+        extra = dict(opt=opt.state_dict(), paso=paso, mejor=mejor, azar=g.get_state()) if para_reanudar else {}
+        guardar_asrn(modelo, archivo, **extra)
 
     modelo.train()
     saltos, t0, piezas = 0, time.time(), 0
@@ -136,7 +139,7 @@ def entrenar(modelo, datos, validacion=None, largo=4096, lote=1, acumular=16, pa
                 registro(f'paso {paso} validacion {pv:.4f} (ppl {math.exp(min(pv, 50)):.2f})')
                 if pv < mejor and guardar_en:
                     mejor = pv
-                    guardar(os.path.splitext(guardar_en)[0] + '.mejor.pt')
+                    guardar(os.path.splitext(guardar_en)[0] + '.mejor.pt', para_reanudar=False)
             if guardar_en and paso % guardar_cada == 0:
                 guardar(guardar_en)
     except KeyboardInterrupt:
