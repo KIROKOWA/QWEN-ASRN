@@ -60,7 +60,8 @@ Apache 2.0, la misma licencia de este repositorio.
 | `submission.py` (v3) | un programa por par de cabezas kv (filas del caché completas); en verify solo 1 programa por SM | 0.83× |
 | `submission_v4.py` | v3 + planificador por longitudes reales + doble búfer en registros, evict_first | por medir |
 | `submission_v5.py` | v2 + planificador + anillo asíncrono de 3–4 etapas en memoria compartida, configuración por forma medida con ptxas | por medir |
-| `submission_v6.py` | **un solo kernel**: softmax con energía de referencia fija (Cauchy–Schwarz), acumulación atómica, cierre por quórum, prefetch al L2, consultas FP8 en verify | por medir |
+| `submission_v6.py` | **un solo kernel**: softmax con energía de referencia fija (Cauchy–Schwarz), acumulación atómica, cierre por quórum, prefetch al L2, consultas FP8 en verify | 0.98× (mejor en ventana, peor en contexto completo) |
+| `submission_v7.py` | v6 con el reparto de la v2 (~16 programas por SM), sin `evict_first` ni prefetch | por medir |
 
 ### v6: la atención como función de partición
 
