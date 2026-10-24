@@ -5,6 +5,7 @@
     python okc_win.py check submission.py       # la corrida completa, fuera del tablero
     python okc_win.py submit submission.py      # la que cuenta
     python okc_win.py status <job>              # el resultado de una corrida
+    python okc_win.py jobs                      # tus corridas recientes (con su job_id)
     python okc_win.py problems                  # limites de hoy y lo que te queda
     python okc_win.py leaderboard [problema]
     python okc_win.py token                     # imprime tu token (para OKC_TOKEN en los Secretos de Colab)
@@ -122,6 +123,11 @@ def main(args):
         login()
     elif orden in ("check", "submit") and len(args) == 2:
         enviar(args[1], "check" if orden == "check" else "run")
+    elif orden == "jobs":
+        r = _api("GET", "/jobs", token=_token())
+        for job in (r.get("jobs", r) if isinstance(r, dict) else r)[:20]:
+            print(json.dumps({k: v for k, v in job.items() if k not in ("code", "log_tail", "profile")},
+                             ensure_ascii=False)[:300])
     elif orden == "status" and len(args) == 2:
         status(args[1])
     elif orden == "problems":
