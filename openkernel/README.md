@@ -60,6 +60,28 @@ Apache 2.0, la misma licencia de este repositorio.
 | `submission.py` (v3) | un programa por par de cabezas kv (filas del caché completas); en verify solo 1 programa por SM | 0.83× |
 | `submission_v4.py` | v3 + planificador por longitudes reales + doble búfer en registros, evict_first | por medir |
 | `submission_v5.py` | v2 + planificador + anillo asíncrono de 3–4 etapas en memoria compartida, configuración por forma medida con ptxas | por medir |
+| `submission_v6.py` | **un solo kernel**: softmax con energía de referencia fija (Cauchy–Schwarz), acumulación atómica, cierre por quórum, prefetch al L2, consultas FP8 en verify | por medir |
+
+### v6: la atención como función de partición
+
+Ideas de otras áreas, cada una porque resuelve algo concreto de este problema:
+
+- **Física estadística: energía de referencia fija.** El softmax es una función de partición, Z = Σ e^(s_i), y cada
+  estado se puede medir contra cualquier energía de referencia c sin cambiar el resultado. FlashAttention usa el máximo
+  corriendo, que obliga a calcular el máximo de cada bloque y a reescalar lo acumulado. Muse normaliza consultas y
+  llaves (QK-norm), así que por **Cauchy–Schwarz** |q·k| ≤ |q||k| = (5.473·8)·8: cada logit (en base 2) cae en un
+  intervalo de ancho ~126, que cabe en el rango normal de float32. Con c = techo − 40, todos los términos quedan en
+  [2^-86, 2^40]: sin máximo, sin reescalar, sin desbordes.
+- **Cantidades extensivas.** Con la misma c en todos los programas, Z y Σ e^(s−c)·v se suman como la masa o la
+  energía: cada programa los agrega con atómicos a un acumulador global. Ya no hay pedazos que guardar ni juntar (en
+  la v2, en verify, los pedazos movían 4 veces más bytes que el propio caché).
+- **Biología: quorum sensing.** Cada programa, al terminar, suma 1 a un contador de su grupo; el que completa el
+  quórum (el último en llegar) cierra: divide, normaliza, aplica la puerta y escribe, y deja acumuladores y contador en
+  cero para la siguiente llamada. Un solo lanzamiento de kernel (SGLang usa cinco).
+- **Bases de datos: prefetching de sondeos sueltos** (como AMAC o el prefetching por grupos en hash joins): las filas
+  de vueltas futuras se piden al L2 con `prefetch.global.L2`, sin ocupar registros ni memoria compartida.
+- **Teoría de colas** (v4) y **anillo asíncrono** (v5), y los programas de un mismo trabajo (sus dos cabezas kv) son
+  vecinos en la malla: piden las mismas filas de 128 bytes casi a la vez, y la memoria las trae una vez.
 
 `python muse_attention_decode/compilar_sm90.py --archivo submission_v4.py` compila para la H200 sin GPU y reporta
 registros, derrames, memoria compartida y programas por SM de cada kernel.

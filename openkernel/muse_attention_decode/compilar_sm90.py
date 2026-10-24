@@ -25,7 +25,8 @@ OBJETIVO = GPUTarget("cuda", 90, 32)
 PTXAS = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin", "ptxas")
 TIPOS = dict(QKV="*bf16", SEQ="*i32", TABLA="*i32", LOC="*i64", KC="*fp8e4nv", VC="*fp8e4nv", KS="*fp32", VS="*fp32",
              MP="*fp32", LP="*fp32", AP="*fp32", OUT="*bf16", paso_qkv="i32", paso_tabla="i32", chunk="i32",
-             n_pedazos="i32", n_trabajos="i32", n_lista="i32", min_chunk="i32", qk_escala="fp32", escala_log2="fp32")
+             n_pedazos="i32", n_trabajos="i32", n_lista="i32", min_chunk="i32", qk_escala="fp32", escala_log2="fp32",
+             ACC="*fp32", SUMA="*fp32", CNT="*i32", c_ref="fp32")
 DIVISIBLES = {"paso_qkv", "chunk", "min_chunk"}
 
 
@@ -59,10 +60,31 @@ def por_sm(regs, compartida, warps):
     return min(65536 // (max(regs, 24) * 32 * warps), (227 * 1024) // max(compartida, 1), 64 // warps, 32)
 
 
+def main_v6(sub):
+    """v6: un solo kernel (_atencion) con la configuracion por forma de sub.CONFIG."""
+    for (hq, hkv), largo, pagina, deslizante in itertools.product([(16, 2), (128, 16)], [1, 8], [1, 64], [True, False]):
+        g = hq // hkv
+        bn, etapas, warps, _, grupos, prefetch, qk_fp8, _, _ = sub.CONFIG[(largo, not deslizante)]
+        filas = max(16, triton.next_power_of_2(largo * g // grupos))
+        constantes = dict(B=4, BB=4, HQ=hq, HKV=hkv, L=largo, G=g, R=grupos, FILAS=filas, PAGINA=pagina,
+                          VENTANA=2048 if deslizante else 0, CON_ROPE=deslizante, BLOQUE_N=bn, ETAPAS=etapas,
+                          BLOQUE_L=max(16, triton.next_power_of_2(largo)), PREFETCH=prefetch, QK_FP8=qk_fp8,
+                          QUORUM=True, EN_CPU=False)
+        rope = "*fp32" if deslizante else "*bf16"
+        r, dr, sh = compilar(sub._atencion, constantes, dict(num_warps=warps), rope)
+        r2, dr2, _ = compilar(sub._cierre, constantes, dict(num_warps=4), rope)
+        print(f"hq={hq:3d} L={largo} pagina={pagina:2d} {'ventana ' if deslizante else 'completa'}: _atencion {r:3d} regs "
+              f"{dr:4d} B derramados {sh:6d} B compartida -> {por_sm(r, sh, warps)}/SM | _cierre {r2} regs {dr2} B derr.",
+              flush=True)
+    print("todas las combinaciones compilan para sm_90")
+
+
 def main():
     archivo = sys.argv[sys.argv.index("--archivo") + 1] if "--archivo" in sys.argv else "submission.py"
     sub = _modulo(archivo)
     print(f"{archivo}: sm_90")
+    if hasattr(sub, "_atencion"):
+        return main_v6(sub)
     for (hq, hkv), largo, pagina, deslizante in itertools.product([(16, 2), (128, 16)], [1, 8], [1, 64], [True, False]):
         g = hq // hkv
         bm = max(16, triton.next_power_of_2(largo * g))
