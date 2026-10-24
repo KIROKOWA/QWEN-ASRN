@@ -1,0 +1,5 @@
+torch>=2.9
+transformers>=4.45
+safetensors
+asrn @ git+https://github.com/KIROKOWA/ASRN.git
+pytest
