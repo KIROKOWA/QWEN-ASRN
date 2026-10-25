@@ -17,7 +17,7 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 
 
 def main():
-    archivo = sys.argv[sys.argv.index("--archivo") + 1] if "--archivo" in sys.argv else "submission_v11.py"
+    archivo = sys.argv[sys.argv.index("--archivo") + 1] if "--archivo" in sys.argv else "submission_v12.py"
     spec = importlib.util.spec_from_file_location("sub", os.path.join(AQUI, archivo))
     sub = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sub)
@@ -26,7 +26,11 @@ def main():
     nvrtc = ctypes.CDLL(glob.glob(os.path.join(raiz, "cu13", "lib", "libnvrtc.so*"))[0])
     prog = ctypes.c_void_p()
     assert nvrtc.nvrtcCreateProgram(ctypes.byref(prog), sub._CUDA_FUENTE.encode(), b"k.cu", 0, None, None) == 0
-    opciones = [b"--gpu-architecture=compute_90a", b"-std=c++17", b"-default-device",
+    # Las mismas macros que pone load_inline de PyTorch (el juez compila asi): sin operadores ni conversiones implicitas
+    # de half y bf16.
+    opciones = [b"--gpu-architecture=compute_90a", b"-std=c++20", b"-default-device",
+                b"-D__CUDA_NO_HALF_OPERATORS__", b"-D__CUDA_NO_HALF_CONVERSIONS__",
+                b"-D__CUDA_NO_BFLOAT16_CONVERSIONS__", b"-D__CUDA_NO_HALF2_OPERATORS__",
                 b"-I" + os.path.join(raiz, "cu13", "include").encode()]
     res = nvrtc.nvrtcCompileProgram(prog, len(opciones), (ctypes.c_char_p * len(opciones))(*opciones))
     n = ctypes.c_size_t()
