@@ -65,6 +65,9 @@ Apache 2.0, la misma licencia de este repositorio.
 | `submission_v8.py` | híbrida: en cada forma, el método que ganó en el juez (quórum con pocas peticiones y en verify con ventana y muchas; pedazos de la v2 en el resto) | **1.27×** |
 | `submission_v9.py` | v8 + experimentos: verify con contexto completo con quórum y ranuras (sin atómicos), decode completo con anillo de 3 etapas, decode con ventana con la configuración de la v6 | 0.91× (las ranuras: verify 1 completo 190 µs) |
 | `submission_v10.py` | v8 + solo lo que ganó en la v9: decode con ventana con la configuración de la v6 (6.0 µs) | por medir |
+| `submission_v11.py` | v10 + **CUDA nativo** en decode con contexto completo y 5+ peticiones ([`cuda_completo.cu`](muse_attention_decode/cuda_completo.cu)): las dos cabezas kv por bloque (filas de 128 bytes), anillo `cp.async` de 4 etapas con swizzle, `mma.sync` en tensor cores, energía de referencia fija; si no compila, vuelve a Triton | por medir |
+
+`compilar_cuda.py` compila el CUDA de una versión para sm_90a sin GPU (NVRTC + `ptxas`), y `simular_cuda.py` simula el kernel carril por carril en numpy (fragmentos de `mma.sync`, swizzle, anillo) contra un cálculo directo.
 
 ### v6: la atención como función de partición
 
