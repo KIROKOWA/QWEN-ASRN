@@ -68,7 +68,8 @@ Apache 2.0, la misma licencia de este repositorio.
 | `submission_v11.py` | v10 + **CUDA nativo** en decode con contexto completo y 5+ peticiones ([`cuda_completo.cu`](muse_attention_decode/cuda_completo.cu)): las dos cabezas kv por bloque (filas de 128 bytes), anillo `cp.async` de 4 etapas con swizzle, `mma.sync` en tensor cores, energía de referencia fija; si no compila, vuelve a Triton | 1.287× por Triton (el CUDA no compiló: `-std=c++17`, el PyTorch del juez exige C++20); es la v10 medida |
 | `submission_v12.py` | v11 compilando con `-std=c++20` | 1.19×: el CUDA **compiló y es correcto**, pero más lento (186/428 µs contra 156/306 de Triton): 219 registros, 8 warps por SM |
 | `submission_v13.py` | CUDA con 8 warps por bloque (uno por cabeza kv y grupo de llaves), `p·v` traspuesto (acumuladores sin relleno), `q` desde memoria compartida, direcciones recalculadas por vuelta: **80 registros, sin derrames, 3 bloques por SM (24 warps)** | 1.26×: empata con Triton (160/320 µs contra 156/306) |
-| `submission_v14.py` | CUDA: `q·k` en FP8 directo (`mma m16n8k32.e4m3`, las llaves no se convierten), `v` a bf16 una vez por vuelta y fragmentos con `ldmatrix.trans`; 71 registros, 3 bloques por SM | por medir |
+| `submission_v14.py` | CUDA: `q·k` en FP8 directo (`mma m16n8k32.e4m3`, las llaves no se convierten), `v` a bf16 una vez por vuelta y fragmentos con `ldmatrix.trans`; 71 registros, 3 bloques por SM | **1.325×** (decode 16/32 completo: 139/261 µs, contra 156/306 de Triton) |
+| `submission_v15.py` | v14 + verify completo (16 y 32 peticiones) en CUDA: cada warp toma 16 consultas reales y las 64 llaves de la vuelta, `p` pasa de registro a registro (como FA2), sin suma entre warps; 80 registros, 3 bloques por SM | por medir |
 
 `compilar_cuda.py` compila el CUDA de una versión para sm_90a sin GPU (NVRTC + `ptxas`), y `simular_cuda.py` simula el kernel carril por carril en numpy (fragmentos de `mma.sync`, swizzle, anillo) contra un cálculo directo.
 
