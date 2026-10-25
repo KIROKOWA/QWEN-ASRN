@@ -71,11 +71,25 @@ def main_v6(sub):
                           BLOQUE_L=max(16, triton.next_power_of_2(largo)), PREFETCH=prefetch, QK_FP8=qk_fp8,
                           QUORUM=True, EN_CPU=False)
         rope = "*fp32" if deslizante else "*bf16"
-        r, dr, sh = compilar(sub._atencion, constantes, dict(num_warps=warps), rope)
-        r2, dr2, _ = compilar(sub._cierre, constantes, dict(num_warps=4), rope)
-        print(f"hq={hq:3d} L={largo} pagina={pagina:2d} {'ventana ' if deslizante else 'completa'}: _atencion {r:3d} regs "
-              f"{dr:4d} B derramados {sh:6d} B compartida -> {por_sm(r, sh, warps)}/SM | _cierre {r2} regs {dr2} B derr.",
-              flush=True)
+        variantes = [False, True] if "RANURAS" in sub._atencion.arg_names else [None]
+        for ranuras in variantes:
+            c = dict(constantes, RANURAS=bool(ranuras))
+            r, dr, sh = compilar(sub._atencion, c, dict(num_warps=warps), rope)
+            r2, dr2, _ = compilar(sub._cierre, c, dict(num_warps=4), rope)
+            print(f"hq={hq:3d} L={largo} pagina={pagina:2d} {'ventana ' if deslizante else 'completa'}"
+                  f"{' ranuras' if ranuras else ''}: _atencion {r:3d} regs {dr:4d} B derramados {sh:6d} B compartida "
+                  f"-> {por_sm(r, sh, warps)}/SM | _cierre {r2} regs {dr2} B derr.", flush=True)
+        if hasattr(sub, "_parcial_v2"):  # el metodo de pedazos (v8/v9)
+            bm = max(16, triton.next_power_of_2(largo * g))
+            bn2 = 64 if deslizante else 128
+            for etapas in (2, 3):
+                c = dict(HQ=hq, HKV=hkv, L=largo, G=g, PAGINA=pagina, VENTANA=2048 if deslizante else 0,
+                         CON_ROPE=deslizante, BLOQUE_M=bm, BLOQUE_N=bn2, ETAPAS=etapas, EN_CPU=False)
+                r, dr, sh = compilar(sub._parcial_v2, c, dict(num_warps=4, num_stages=2), rope)
+                print(f"    _parcial_v2 etapas={etapas}: {r} regs {dr} B derramados {sh} B -> {por_sm(r, sh, 4)}/SM")
+            r, dr, _ = compilar(sub._final_v2, dict(c, BLOQUE_S=64, BLOQUE_L=triton.next_power_of_2(largo)),
+                                dict(num_warps=4), rope)
+            print(f"    _final_v2: {r} regs {dr} B derramados", flush=True)
     print("todas las combinaciones compilan para sm_90")
 
 
