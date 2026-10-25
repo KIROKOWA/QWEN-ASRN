@@ -63,7 +63,8 @@ Apache 2.0, la misma licencia de este repositorio.
 | `submission_v6.py` | **un solo kernel**: softmax con energía de referencia fija (Cauchy–Schwarz), acumulación atómica, cierre por quórum, prefetch al L2, consultas FP8 en verify | 0.98× (mejor en ventana, peor en contexto completo) |
 | `submission_v7.py` | v6 con el reparto de la v2 (~16 programas por SM), sin `evict_first` ni prefetch | 1.16× |
 | `submission_v8.py` | híbrida: en cada forma, el método que ganó en el juez (quórum con pocas peticiones y en verify con ventana y muchas; pedazos de la v2 en el resto) | **1.27×** |
-| `submission_v9.py` | v8 + experimentos: verify con contexto completo con quórum y ranuras (sin atómicos), decode completo con anillo de 3 etapas, decode con ventana con la configuración de la v6 | por medir |
+| `submission_v9.py` | v8 + experimentos: verify con contexto completo con quórum y ranuras (sin atómicos), decode completo con anillo de 3 etapas, decode con ventana con la configuración de la v6 | 0.91× (las ranuras: verify 1 completo 190 µs) |
+| `submission_v10.py` | v8 + solo lo que ganó en la v9: decode con ventana con la configuración de la v6 (6.0 µs) | por medir |
 
 ### v6: la atención como función de partición
 
