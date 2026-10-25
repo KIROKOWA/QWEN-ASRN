@@ -66,7 +66,8 @@ Apache 2.0, la misma licencia de este repositorio.
 | `submission_v9.py` | v8 + experimentos: verify con contexto completo con quórum y ranuras (sin atómicos), decode completo con anillo de 3 etapas, decode con ventana con la configuración de la v6 | 0.91× (las ranuras: verify 1 completo 190 µs) |
 | `submission_v10.py` | v8 + solo lo que ganó en la v9: decode con ventana con la configuración de la v6 (6.0 µs) | **1.287×** (medida como la v11 sin CUDA) |
 | `submission_v11.py` | v10 + **CUDA nativo** en decode con contexto completo y 5+ peticiones ([`cuda_completo.cu`](muse_attention_decode/cuda_completo.cu)): las dos cabezas kv por bloque (filas de 128 bytes), anillo `cp.async` de 4 etapas con swizzle, `mma.sync` en tensor cores, energía de referencia fija; si no compila, vuelve a Triton | 1.287× por Triton (el CUDA no compiló: `-std=c++17`, el PyTorch del juez exige C++20); es la v10 medida |
-| `submission_v12.py` | v11 compilando con `-std=c++20` | por medir |
+| `submission_v12.py` | v11 compilando con `-std=c++20` | 1.19×: el CUDA **compiló y es correcto**, pero más lento (186/428 µs contra 156/306 de Triton): 219 registros, 8 warps por SM |
+| `submission_v13.py` | CUDA con 8 warps por bloque (uno por cabeza kv y grupo de llaves), `p·v` traspuesto (acumuladores sin relleno), `q` desde memoria compartida, direcciones recalculadas por vuelta: **80 registros, sin derrames, 3 bloques por SM (24 warps)** | por medir |
 
 `compilar_cuda.py` compila el CUDA de una versión para sm_90a sin GPU (NVRTC + `ptxas`), y `simular_cuda.py` simula el kernel carril por carril en numpy (fragmentos de `mma.sync`, swizzle, anillo) contra un cálculo directo.
 

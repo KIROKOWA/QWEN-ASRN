@@ -1,4 +1,5 @@
-"""Simulador en numpy del kernel CUDA parcial_completo (cuda_completo.cu), carril por carril, para revisar sin GPU los
+"""Simulador en numpy del kernel CUDA parcial_completo (cuda_completo.cu, v13: 8 warps, uno por cabeza kv y grupo de 16
+llaves; p.v traspuesto), carril por carril, para revisar sin GPU los
 indices: los fragmentos de mma.sync m16n8k16 (formato de la documentacion de PTX), el swizzle de la memoria
 compartida, el anillo de vueltas y la reduccion entre warps. Compara el pedazo que produce con un calculo directo.
 
@@ -52,76 +53,80 @@ def simular(qkv_b, kc, vc, tabla_b, pagina, seq, s, chunk, k_scale, qk_escala, e
     q = torch.tensor(q).to(torch.bfloat16).to(torch.float16).double().numpy()
     escala = k_scale * escala_log2
 
-    def pedir(vuelta):  # lo que hacen los 128 hilos con cp.async
+    def pedir(vuelta):  # lo que hacen los 256 hilos con cp.async (fila hilo // 4, cuarto hilo % 4)
         base = (vuelta % ETAPAS) * 2 * LLAVES * FILA
-        for hilo in range(128):
-            fila_c, mitad = hilo >> 1, hilo & 1
+        for hilo in range(256):
+            fila_c, cuarto = hilo >> 2, hilo & 3
             t = inicio + vuelta * LLAVES + fila_c
             fila = int(tabla_b[t // pagina]) * pagina + t % pagina if t < fin else 0
-            for c in range(4):
-                byte = mitad * 64 + c * 16
+            for c in range(2):
+                byte = cuarto * 32 + c * 16
                 smem[base + lugar(fila_c, byte):base + lugar(fila_c, byte) + 16] = kc[fila, byte:byte + 16]
                 d = base + LLAVES * FILA + lugar(fila_c, byte)
                 smem[d:d + 16] = vc[fila, byte:byte + 16]
 
     for v in range(min(ETAPAS - 1, n_vueltas)):
         pedir(v)
-    o = np.zeros((4, 32, 2, 8, 4))
-    l = np.zeros((4, 32, 2))
+    o = np.zeros((8, 32, 4, 4))   # [warp][carril][md][fragmento C de o^T]
+    l = np.zeros((8, 32))
     for vuelta in range(n_vueltas):
         if vuelta + ETAPAS - 1 < n_vueltas:
             pedir(vuelta + ETAPAS - 1)
         ks = (vuelta % ETAPAS) * 2 * LLAVES * FILA
         vs = ks + LLAVES * FILA
-        for warp in range(4):
-            llave0 = warp * 16
+        for warp in range(8):
+            h, kg = warp >> 2, warp & 3
+            llave0 = kg * 16
             t0 = inicio + vuelta * LLAVES + llave0
-            for h in range(2):
-                sc = []
-                for nb in range(2):
-                    c = np.zeros((32, 4))
-                    for kk in range(4):
-                        a, b = [], []
-                        for carril in range(32):
-                            g, tig = carril // 4, carril % 4
-                            fila = llave0 + nb * 8 + g
-                            byte = h * 64 + kk * 16 + tig * 2
-                            a.append([q[h * 8 + g, kk * 16 + tig * 2:kk * 16 + tig * 2 + 2], [0, 0],
-                                      q[h * 8 + g, kk * 16 + 8 + tig * 2:kk * 16 + 8 + tig * 2 + 2], [0, 0]])
-                            b.append([e4m3(smem[ks + lugar(fila, byte):ks + lugar(fila, byte) + 2]),
-                                      e4m3(smem[ks + lugar(fila, byte + 8):ks + lugar(fila, byte + 8) + 2])])
-                        c = mma(a, b, c)
-                    sc.append(c)
-                p = np.zeros((32, 2, 2))
-                for carril in range(32):
-                    g, tig = carril // 4, carril % 4
-                    for nb in range(2):
-                        for i in range(2):
-                            t = t0 + nb * 8 + tig * 2 + i
-                            e = min(sc[nb][carril][i] * escala - c_ref, 100.0)
-                            p[carril, nb, i] = 2.0 ** e if t < fin else 0.0
-                            l[warp, carril, h] += p[carril, nb, i]
-                pb = torch.tensor(p).to(torch.bfloat16).double().numpy()
-                for nd in range(8):
+            pa = []   # [nb][carril] -> par (bf16) de p
+            for nb in range(2):
+                c = np.zeros((32, 4))
+                for kk in range(4):
                     a, b = [], []
                     for carril in range(32):
                         g, tig = carril // 4, carril % 4
-                        fv0, fv8 = llave0 + tig * 2, llave0 + 8 + tig * 2
-                        byte = h * 64 + nd * 8 + g
-                        a.append([pb[carril, 0], [0, 0], pb[carril, 1], [0, 0]])
-                        b.append([e4m3([smem[vs + lugar(fv0, byte)], smem[vs + lugar(fv0 + 1, byte)]]),
-                                  e4m3([smem[vs + lugar(fv8, byte)], smem[vs + lugar(fv8 + 1, byte)]])])
-                    o[warp, :, h, nd] = mma(a, b, o[warp, :, h, nd])
-    # Reduccion entre warps (como el kernel).
+                        fila = llave0 + nb * 8 + g
+                        byte = h * 64 + kk * 16 + tig * 2
+                        a.append([q[h * 8 + g, kk * 16 + tig * 2:kk * 16 + tig * 2 + 2], [0, 0],
+                                  q[h * 8 + g, kk * 16 + 8 + tig * 2:kk * 16 + 8 + tig * 2 + 2], [0, 0]])
+                        b.append([e4m3(smem[ks + lugar(fila, byte):ks + lugar(fila, byte) + 2]),
+                                  e4m3(smem[ks + lugar(fila, byte + 8):ks + lugar(fila, byte + 8) + 2])])
+                    c = mma(a, b, c)
+                par = np.zeros((32, 2))
+                for carril in range(32):
+                    g, tig = carril // 4, carril % 4
+                    t = t0 + nb * 8 + tig * 2
+                    p0 = 2.0 ** min(c[carril][0] * escala - c_ref, 100.0) if t < fin else 0.0
+                    p1 = 2.0 ** min(c[carril][1] * escala - c_ref, 100.0) if t + 1 < fin else 0.0
+                    l[warp, carril] += p0 + p1
+                    par[carril] = [p0, p1]
+                pa.append(torch.tensor(par).to(torch.bfloat16).double().numpy())
+
+            def v_par(f, byte):
+                return e4m3([smem[vs + lugar(f, byte)], smem[vs + lugar(f + 1, byte)]])
+
+            for md in range(4):
+                a, b = [], []
+                for carril in range(32):
+                    g, tig = carril // 4, carril % 4
+                    fv0, fv8 = llave0 + tig * 2, llave0 + 8 + tig * 2
+                    byte = h * 64 + md * 16 + g
+                    a.append([v_par(fv0, byte), v_par(fv0, byte + 8), v_par(fv8, byte), v_par(fv8, byte + 8)])
+                    b.append([pa[0][carril], pa[1][carril]])
+                o[warp, :, md] = mma(a, b, o[warp, :, md])
+    # Reduccion entre los 4 warps de cada cabeza (como el kernel): o^T[dim][consulta] -> ACC[cabeza][consulta][dim].
     L = np.zeros((2, 8))
     ACC = np.zeros((2, 8, 64))
-    for warp in range(4):
+    for warp in range(8):
+        h = warp >> 2
         for carril in range(32):
             g, tig = carril // 4, carril % 4
-            for h in range(2):
-                L[h, g] += l[warp, carril, h]
-                for nd in range(8):
-                    ACC[h, g, nd * 8 + tig * 2:nd * 8 + tig * 2 + 2] += o[warp, carril, h, nd, :2]
+            L[h, g] += l[warp, carril]
+            for md in range(4):
+                ACC[h, tig * 2, md * 16 + g] += o[warp, carril, md, 0]
+                ACC[h, tig * 2 + 1, md * 16 + g] += o[warp, carril, md, 1]
+                ACC[h, tig * 2, md * 16 + g + 8] += o[warp, carril, md, 2]
+                ACC[h, tig * 2 + 1, md * 16 + g + 8] += o[warp, carril, md, 3]
     return L, ACC
 
 
