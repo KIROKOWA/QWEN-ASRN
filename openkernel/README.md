@@ -40,6 +40,7 @@ el caché. No sincroniza con la CPU ni ramifica sobre valores, así que se puede
 ```bash
 okc init muse_attention_decode oficial/        # reference.py, checks.py, baseline.py, TASK.md (no se suben al repo)
 python muse_attention_decode/probar_local.py oficial/ [--grandes]     # ¿correcto? (GPU; en CPU: TRITON_INTERPRET=1)
+python muse_attention_decode/compilar_sm90.py                          # ¿compila para la H200? (sin GPU)
 python muse_attention_decode/medir.py oficial/                         # µs por forma, con CUDA graphs y L2 frío
 okc check muse_attention_decode/submission.py                          # el juez, fuera del tablero
 okc submit muse_attention_decode/submission.py
@@ -49,6 +50,52 @@ okc submit muse_attention_decode/submission.py
 y Linux; en Windows (o en Colab) usa [`okc_win.py`](okc_win.py), un cliente de su API HTTP que solo necesita Python:
 `python okc_win.py login`, `check submission.py`, `submit submission.py`, `status <job>`, `leaderboard`. Al enviar, el código queda bajo
 Apache 2.0, la misma licencia de este repositorio.
+
+### Versiones
+
+| archivo | qué tiene | juez (H200) |
+|---|---|---|
+| v1 (historia de git) | dos kernels, ~2 programas por SM | 0.87× |
+| `submission_v2.py` | ~16 programas por SM, bloques de 128, tabla de páginas pedida antes | 1.19× (la mejor) |
+| `submission.py` (v3) | un programa por par de cabezas kv (filas del caché completas); en verify solo 1 programa por SM | 0.83× |
+| `submission_v4.py` | v3 + planificador por longitudes reales + doble búfer en registros, evict_first | por medir |
+| `submission_v5.py` | v2 + planificador + anillo asíncrono de 3–4 etapas en memoria compartida, configuración por forma medida con ptxas | por medir |
+| `submission_v6.py` | **un solo kernel**: softmax con energía de referencia fija (Cauchy–Schwarz), acumulación atómica, cierre por quórum, prefetch al L2, consultas FP8 en verify | 0.98× (mejor en ventana, peor en contexto completo) |
+| `submission_v7.py` | v6 con el reparto de la v2 (~16 programas por SM), sin `evict_first` ni prefetch | 1.16× |
+| `submission_v8.py` | híbrida: en cada forma, el método que ganó en el juez (quórum con pocas peticiones y en verify con ventana y muchas; pedazos de la v2 en el resto) | **1.27×** |
+| `submission_v9.py` | v8 + experimentos: verify con contexto completo con quórum y ranuras (sin atómicos), decode completo con anillo de 3 etapas, decode con ventana con la configuración de la v6 | 0.91× (las ranuras: verify 1 completo 190 µs) |
+| `submission_v10.py` | v8 + solo lo que ganó en la v9: decode con ventana con la configuración de la v6 (6.0 µs) | **1.287×** (medida como la v11 sin CUDA) |
+| `submission_v11.py` | v10 + **CUDA nativo** en decode con contexto completo y 5+ peticiones ([`cuda_completo.cu`](muse_attention_decode/cuda_completo.cu)): las dos cabezas kv por bloque (filas de 128 bytes), anillo `cp.async` de 4 etapas con swizzle, `mma.sync` en tensor cores, energía de referencia fija; si no compila, vuelve a Triton | 1.287× por Triton (el CUDA no compiló: `-std=c++17`, el PyTorch del juez exige C++20); es la v10 medida |
+| `submission_v12.py` | v11 compilando con `-std=c++20` | 1.19×: el CUDA **compiló y es correcto**, pero más lento (186/428 µs contra 156/306 de Triton): 219 registros, 8 warps por SM |
+| `submission_v13.py` | CUDA con 8 warps por bloque (uno por cabeza kv y grupo de llaves), `p·v` traspuesto (acumuladores sin relleno), `q` desde memoria compartida, direcciones recalculadas por vuelta: **80 registros, sin derrames, 3 bloques por SM (24 warps)** | 1.26×: empata con Triton (160/320 µs contra 156/306) |
+| `submission_v14.py` | CUDA: `q·k` en FP8 directo (`mma m16n8k32.e4m3`, las llaves no se convierten), `v` a bf16 una vez por vuelta y fragmentos con `ldmatrix.trans`; 71 registros, 3 bloques por SM | **1.325×** (decode 16/32 completo: 139/261 µs, contra 156/306 de Triton) |
+| `submission_v15.py` | v14 + verify completo (16 y 32 peticiones) en CUDA: cada warp toma 16 consultas reales y las 64 llaves de la vuelta, `p` pasa de registro a registro (como FA2), sin suma entre warps; 80 registros, 3 bloques por SM | por medir |
+
+`compilar_cuda.py` compila el CUDA de una versión para sm_90a sin GPU (NVRTC + `ptxas`), y `simular_cuda.py` simula el kernel carril por carril en numpy (fragmentos de `mma.sync`, swizzle, anillo) contra un cálculo directo.
+
+### v6: la atención como función de partición
+
+Ideas de otras áreas, cada una porque resuelve algo concreto de este problema:
+
+- **Física estadística: energía de referencia fija.** El softmax es una función de partición, Z = Σ e^(s_i), y cada
+  estado se puede medir contra cualquier energía de referencia c sin cambiar el resultado. FlashAttention usa el máximo
+  corriendo, que obliga a calcular el máximo de cada bloque y a reescalar lo acumulado. Muse normaliza consultas y
+  llaves (QK-norm), así que por **Cauchy–Schwarz** |q·k| ≤ |q||k| = (5.473·8)·8: cada logit (en base 2) cae en un
+  intervalo de ancho ~126, que cabe en el rango normal de float32. Con c = techo − 40, todos los términos quedan en
+  [2^-86, 2^40]: sin máximo, sin reescalar, sin desbordes.
+- **Cantidades extensivas.** Con la misma c en todos los programas, Z y Σ e^(s−c)·v se suman como la masa o la
+  energía: cada programa los agrega con atómicos a un acumulador global. Ya no hay pedazos que guardar ni juntar (en
+  la v2, en verify, los pedazos movían 4 veces más bytes que el propio caché).
+- **Biología: quorum sensing.** Cada programa, al terminar, suma 1 a un contador de su grupo; el que completa el
+  quórum (el último en llegar) cierra: divide, normaliza, aplica la puerta y escribe, y deja acumuladores y contador en
+  cero para la siguiente llamada. Un solo lanzamiento de kernel (SGLang usa cinco).
+- **Bases de datos: prefetching de sondeos sueltos** (como AMAC o el prefetching por grupos en hash joins): las filas
+  de vueltas futuras se piden al L2 con `prefetch.global.L2`, sin ocupar registros ni memoria compartida.
+- **Teoría de colas** (v4) y **anillo asíncrono** (v5), y los programas de un mismo trabajo (sus dos cabezas kv) son
+  vecinos en la malla: piden las mismas filas de 128 bytes casi a la vez, y la memoria las trae una vez.
+
+`python muse_attention_decode/compilar_sm90.py --archivo submission_v4.py` compila para la H200 sin GPU y reporta
+registros, derrames, memoria compartida y programas por SM de cada kernel.
 
 ### Qué falta probar para que sea más rápido
 

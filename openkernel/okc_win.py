@@ -5,6 +5,7 @@
     python okc_win.py check submission.py       # la corrida completa, fuera del tablero
     python okc_win.py submit submission.py      # la que cuenta
     python okc_win.py status <job>              # el resultado de una corrida
+    python okc_win.py jobs                      # tus corridas recientes (con su job_id)
     python okc_win.py problems                  # limites de hoy y lo que te queda
     python okc_win.py leaderboard [problema]
     python okc_win.py token                     # imprime tu token (para OKC_TOKEN en los Secretos de Colab)
@@ -107,11 +108,25 @@ def status(job, carpeta="."):
     salida = os.path.join(carpeta, "profiles", f"submission.{job}.json")
     with open(salida, "w", encoding="utf-8") as f:
         json.dump(r, f, indent=1, ensure_ascii=False)
-    resultado = {k: v for k, v in r.items() if k not in ("log_tail", "code", "profile")}
-    print(json.dumps(resultado, indent=1, ensure_ascii=False)[:6000])
+    _resumen(r)
     if r.get("log_tail"):
         print("--- lo que imprimio la corrida (final) ---\n" + r["log_tail"][-3000:])
     print(f"(todo el resultado en {salida})")
+
+
+def _resumen(r):
+    """Una linea por prueba y por forma medida, y lo demas del resultado: sin cortar lo que importa."""
+    res = r.get("result") or {}
+    print(f"corrida {r.get('id')} ({r.get('mode')}): {r.get('status')}, passed={res.get('passed')}, "
+          f"error={res.get('error')}, banderas={res.get('flags')}, revision={res.get('checks')}")
+    for rec in res.get("records", []):
+        if rec.get("event") == "test":
+            print(f"  prueba {rec.get('index'):>2} {rec.get('status'):5s} {rec.get('case')}  {rec.get('message', '')[:300]}")
+        else:
+            print("  " + json.dumps(rec, ensure_ascii=False)[:800])
+    resto = {k: v for k, v in res.items() if k not in ("records", "machine", "checks", "passed", "error", "flags")}
+    if resto:
+        print(json.dumps(resto, indent=1, ensure_ascii=False)[:4000])
 
 
 def main(args):
@@ -122,6 +137,11 @@ def main(args):
         login()
     elif orden in ("check", "submit") and len(args) == 2:
         enviar(args[1], "check" if orden == "check" else "run")
+    elif orden == "jobs":
+        r = _api("GET", "/jobs", token=_token())
+        for job in (r.get("jobs", r) if isinstance(r, dict) else r)[:20]:
+            print(json.dumps({k: v for k, v in job.items() if k not in ("code", "log_tail", "profile")},
+                             ensure_ascii=False)[:300])
     elif orden == "status" and len(args) == 2:
         status(args[1])
     elif orden == "problems":

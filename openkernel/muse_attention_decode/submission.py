@@ -7,7 +7,7 @@ en la memoria de la GPU, y los pedazos del contexto se juntan con la misma compo
 paralelo: (m1, l1, a1) y (m2, l2, a2) dan (m, l1 2^(m1-m) + l2 2^(m2-m), a1 2^(m1-m) + a2 2^(m2-m)). Las filas sin
 llaves validas llevan un maximo finito muy negativo, como _softmax_valido de ASRN, para que nunca den NaN.
 
-  _parcial  una pieza de programa por (pedazo del contexto, peticion, cabeza kv): normaliza (y rota) sus consultas, lee
+  _parcial  un programa por (pedazo del contexto, peticion, par de cabezas kv): normaliza (y rota) sus consultas, lee
             las llaves y valores FP8 ya guardados del pedazo y deja (maximo, suma, acumulado) del softmax en linea.
   _final    una por (peticion, cabeza kv, fila de consulta): junta los pedazos, agrega las L llaves nuevas del bloque
             (normalizadas, rotadas, redondeadas a FP8, que tambien guarda en el cache) y aplica rmsnorm x sigmoid(gate).
@@ -54,10 +54,10 @@ class Inputs(TypedDict):
 
 RMS_EPS = 1e-5
 LOG2E = 1.4426950408889634
-VACIO = -1e30                 # maximo de una fila sin llaves validas: finito, para que 2^(m - m') no de NaN
+VACIO = tl.constexpr(-1e30)   # maximo de una fila sin llaves validas: finito, para que 2^(m - m') no de NaN
 ROPE_POSITIONS = 1 << 21      # como el RotaryEmbedding de SGLang (y baseline.py)
-BLOQUE_N = 64                 # llaves por vuelta de _parcial
-MAX_PEDAZOS = 128             # tope de pedazos por (peticion, cabeza kv): _final los junta de una vez
+PROGRAMAS_POR_SM = 16         # _parcial: muchos programas en vuelo, para tapar la espera de las lecturas sueltas
+BLOQUE_S = 128                # _final junta los pedazos de a tantos
 _ROPE = {}
 _SMS = {}
 
@@ -108,14 +108,52 @@ def _norma_rope(base, pos, ROPE, escala, CON_ROPE: tl.constexpr):
 
 
 @triton.jit
+def _filas(TABLA, b, paso_tabla, t, fin, PAGINA: tl.constexpr):
+    """Filas del cache (int64) de las posiciones t de la peticion b; 0 en las que no llegan a fin."""
+    ok = t < fin
+    if PAGINA == 1:
+        return tl.load(TABLA + b * paso_tabla + t, mask=ok, other=0).to(tl.int64)
+    return tl.load(TABLA + b * paso_tabla + t // PAGINA, mask=ok, other=0).to(tl.int64) * PAGINA + t % PAGINA
+
+
+@triton.jit
+def _paso(q, k, v, valido, m, suma, acc, escala, EN_CPU: tl.constexpr):
+    """Una vuelta del softmax en linea: las llaves k y valores v ([N, 64] bf16) sobre las consultas q ([M, 64] bf16)."""
+    if EN_CPU:  # el interprete de Triton multiplica mal en bf16: alli, en float32 exacto
+        sc = tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32)), input_precision="ieee") * escala
+    else:
+        sc = tl.dot(q, tl.trans(k)) * escala
+    sc = tl.where(valido, sc, float("-inf"))
+    m_nuevo = tl.maximum(m, tl.max(sc, 1))
+    alfa = tl.math.exp2(m - m_nuevo)
+    p = tl.math.exp2(sc - m_nuevo[:, None])
+    suma = suma * alfa + tl.sum(p, 1)
+    if EN_CPU:
+        pv = tl.dot(p.to(tl.bfloat16).to(tl.float32), v.to(tl.float32), input_precision="ieee")
+    else:
+        pv = tl.dot(p.to(tl.bfloat16), v)
+    return m_nuevo, suma, acc * alfa[:, None] + pv
+
+
+@triton.jit
+def _guardar(MP, LP, AP, donde, fila_ok, m, suma, acc):
+    d = tl.arange(0, 64)
+    tl.store(MP + donde, m, mask=fila_ok)
+    tl.store(LP + donde, suma, mask=fila_ok)
+    tl.store(AP + donde[:, None] * 64 + d[None, :], acc, mask=fila_ok[:, None])
+
+
+@triton.jit
 def _parcial(QKV, SEQ, TABLA, KC, VC, KS, ROPE, MP, LP, AP, paso_qkv, paso_tabla, chunk, n_pedazos, qk_escala,
              escala_log2, HQ: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, G: tl.constexpr,
              PAGINA: tl.constexpr, VENTANA: tl.constexpr, CON_ROPE: tl.constexpr, BLOQUE_M: tl.constexpr,
-             BLOQUE_N: tl.constexpr, EN_CPU: tl.constexpr):
+             BLOQUE_N: tl.constexpr, PAR: tl.constexpr, EN_CPU: tl.constexpr):
+    """Un pedazo del contexto para PAR cabezas kv seguidas (h0, h0 + 1): con PAR = 2 cada programa pide las dos
+    mitades de cada fila suelta del cache (128 bytes seguidos) a la vez, y no una mitad cada uno en otro momento."""
     s = tl.program_id(0)
-    bh = tl.program_id(1)
-    b = bh // HKV
-    h = bh % HKV
+    bp = tl.program_id(1)
+    b = bp // (HKV // PAR)
+    h0 = (bp % (HKV // PAR)) * PAR
     seq = tl.load(SEQ + b)
     filas = tl.arange(0, BLOQUE_M)
     fila_ok = filas < L * G
@@ -124,8 +162,10 @@ def _parcial(QKV, SEQ, TABLA, KC, VC, KS, ROPE, MP, LP, AP, paso_qkv, paso_tabla
     pos = seq + j
     d = tl.arange(0, 64)
 
-    base_q = QKV + (b * L + j).to(tl.int64) * paso_qkv + (h * G + g) * 64
-    q = _norma_rope(base_q, pos, ROPE, qk_escala, CON_ROPE).to(tl.bfloat16)  # filas de relleno: copias de la fila 0
+    base_q = QKV + (b * L + j).to(tl.int64) * paso_qkv + (h0 * G + g) * 64
+    q0 = _norma_rope(base_q, pos, ROPE, qk_escala, CON_ROPE).to(tl.bfloat16)  # filas de relleno: copias de la fila 0
+    if PAR == 2:
+        q1 = _norma_rope(base_q + G * 64, pos, ROPE, qk_escala, CON_ROPE).to(tl.bfloat16)
 
     # Las llaves ya guardadas que ve alguna fila del bloque: [lo, seq). La ventana de la fila j empieza en seq + j - V + 1.
     if VENTANA > 0:
@@ -136,48 +176,41 @@ def _parcial(QKV, SEQ, TABLA, KC, VC, KS, ROPE, MP, LP, AP, paso_qkv, paso_tabla
     fin = tl.minimum(inicio + chunk, seq)
     escala = tl.load(KS) * escala_log2
 
-    m = tl.full([BLOQUE_M], VACIO, tl.float32)
-    suma = tl.zeros([BLOQUE_M], tl.float32)
-    acc = tl.zeros([BLOQUE_M, 64], tl.float32)
+    m0 = tl.full([BLOQUE_M], VACIO, tl.float32)
+    suma0 = tl.zeros([BLOQUE_M], tl.float32)
+    acc0 = tl.zeros([BLOQUE_M, 64], tl.float32)
+    m1, suma1, acc1 = m0, suma0, acc0
+    # La tabla de paginas de la vuelta siguiente se pide antes de leer las llaves de esta: asi la lectura de la tabla
+    # y la de las filas sueltas del cache que dependen de ella no se esperan una a la otra.
+    fila_sig = _filas(TABLA, b, paso_tabla, inicio + tl.arange(0, BLOQUE_N), fin, PAGINA)
     for t0 in range(inicio, fin, BLOQUE_N):
         t = t0 + tl.arange(0, BLOQUE_N)
         ok = t < fin
-        if PAGINA == 1:
-            fila_c = tl.load(TABLA + b * paso_tabla + t, mask=ok, other=0).to(tl.int64)
-        else:
-            fila_c = tl.load(TABLA + b * paso_tabla + t // PAGINA, mask=ok, other=0).to(tl.int64) * PAGINA + t % PAGINA
-        off = fila_c[:, None] * (HKV * 64) + h * 64 + d[None, :]
-        k = tl.load(KC + off, mask=ok[:, None], other=0.0).to(tl.bfloat16)
-        v = tl.load(VC + off, mask=ok[:, None], other=0.0).to(tl.bfloat16)
-        if EN_CPU:  # el interprete de Triton multiplica mal en bf16: alli, en float32 exacto
-            sc = tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32)), input_precision="ieee") * escala
-        else:
-            sc = tl.dot(q, tl.trans(k)) * escala
+        fila_c = fila_sig
+        fila_sig = _filas(TABLA, b, paso_tabla, t + BLOQUE_N, fin, PAGINA)
+        off = fila_c[:, None] * (HKV * 64) + h0 * 64 + d[None, :]
+        k0 = tl.load(KC + off, mask=ok[:, None], other=0.0).to(tl.bfloat16)
+        v0 = tl.load(VC + off, mask=ok[:, None], other=0.0).to(tl.bfloat16)
+        if PAR == 2:
+            k1 = tl.load(KC + off + 64, mask=ok[:, None], other=0.0).to(tl.bfloat16)
+            v1 = tl.load(VC + off + 64, mask=ok[:, None], other=0.0).to(tl.bfloat16)
         valido = ok[None, :]
         if VENTANA > 0:
             valido = valido & (t[None, :] > pos[:, None] - VENTANA)
-        sc = tl.where(valido, sc, float("-inf"))
-        m_nuevo = tl.maximum(m, tl.max(sc, 1))
-        alfa = tl.math.exp2(m - m_nuevo)
-        p = tl.math.exp2(sc - m_nuevo[:, None])
-        suma = suma * alfa + tl.sum(p, 1)
-        if EN_CPU:
-            acc = acc * alfa[:, None] + tl.dot(p.to(tl.bfloat16).to(tl.float32), v.to(tl.float32),
-                                               input_precision="ieee")
-        else:
-            acc = acc * alfa[:, None] + tl.dot(p.to(tl.bfloat16), v)
-        m = m_nuevo
+        m0, suma0, acc0 = _paso(q0, k0, v0, valido, m0, suma0, acc0, escala, EN_CPU)
+        if PAR == 2:
+            m1, suma1, acc1 = _paso(q1, k1, v1, valido, m1, suma1, acc1, escala, EN_CPU)
 
-    donde = (bh * n_pedazos + s) * BLOQUE_M + filas
-    tl.store(MP + donde, m)
-    tl.store(LP + donde, suma)
-    tl.store(AP + donde[:, None] * 64 + d[None, :], acc)
+    bh = b * HKV + h0
+    _guardar(MP, LP, AP, (bh * n_pedazos + s) * BLOQUE_M + filas, fila_ok, m0, suma0, acc0)
+    if PAR == 2:
+        _guardar(MP, LP, AP, ((bh + 1) * n_pedazos + s) * BLOQUE_M + filas, fila_ok, m1, suma1, acc1)
 
 
 @triton.jit
 def _final(QKV, SEQ, LOC, KC, VC, KS, VS, ROPE, MP, LP, AP, OUT, paso_qkv, n_pedazos, qk_escala, escala_log2,
            HQ: tl.constexpr, HKV: tl.constexpr, L: tl.constexpr, G: tl.constexpr, CON_ROPE: tl.constexpr,
-           BLOQUE_M: tl.constexpr, BLOQUE_S: tl.constexpr):
+           BLOQUE_M: tl.constexpr, BLOQUE_S: tl.constexpr, BLOQUE_L: tl.constexpr):
     pid = tl.program_id(0)
     bh = pid // (L * G)
     r = pid % (L * G)
@@ -190,39 +223,45 @@ def _final(QKV, SEQ, LOC, KC, VC, KS, VS, ROPE, MP, LP, AP, OUT, paso_qkv, n_ped
     uno = tl.arange(0, 1)
     ks, vs = tl.load(KS), tl.load(VS)
 
-    # Juntar los pedazos de _parcial de una vez (composicion asociativa del softmax en linea).
-    sidx = tl.arange(0, BLOQUE_S)
-    hay = sidx < n_pedazos
-    donde = (bh * n_pedazos + sidx) * BLOQUE_M + r
-    ms = tl.load(MP + donde, mask=hay, other=VACIO)
-    m = tl.max(ms, 0)
-    w = tl.math.exp2(ms - m) * hay
-    suma = tl.sum(tl.load(LP + donde, mask=hay, other=0.0) * w, 0)
-    acc = tl.sum(tl.load(AP + donde[:, None] * 64 + d[None, :], mask=hay[:, None], other=0.0) * w[:, None], 0)
+    # Juntar los pedazos de _parcial de a BLOQUE_S (composicion asociativa del softmax en linea).
+    m = tl.max(tl.full([BLOQUE_S], VACIO, tl.float32), 0)
+    suma = tl.sum(tl.zeros([BLOQUE_S], tl.float32), 0)
+    acc = tl.zeros([64], tl.float32)
+    for s0 in range(0, n_pedazos, BLOQUE_S):
+        sidx = s0 + tl.arange(0, BLOQUE_S)
+        hay = sidx < n_pedazos
+        donde = (bh * n_pedazos + sidx) * BLOQUE_M + r
+        ms = tl.load(MP + donde, mask=hay, other=VACIO)
+        m_nuevo = tl.maximum(m, tl.max(ms, 0))
+        alfa = tl.math.exp2(m - m_nuevo)
+        w = tl.where(hay, tl.math.exp2(ms - m_nuevo), 0.0)
+        suma = suma * alfa + tl.sum(tl.load(LP + donde, mask=hay, other=0.0) * w, 0)
+        acc = acc * alfa + tl.sum(tl.load(AP + donde[:, None] * 64 + d[None, :], mask=hay[:, None], other=0.0)
+                                  * w[:, None], 0)
+        m = m_nuevo
 
     fila_q = QKV + (b * L + j).to(tl.int64) * paso_qkv + cabeza * 64 + uno
     q = tl.reshape(_norma_rope(fila_q, seq + j + uno, ROPE, qk_escala, CON_ROPE), (64,))
     q = q.to(tl.bfloat16).to(tl.float32)
     escribe = r == 0  # una fila por (peticion, cabeza kv) guarda las llaves y valores nuevos
 
-    # Las L piezas del bloque: cada fila j ve las i <= j (siempre dentro de la ventana, que es mucho mas larga).
-    for i in tl.static_range(L):
-        tok = (b * L + i).to(tl.int64)
-        fila_k = QKV + tok * paso_qkv + (HQ + h) * 64 + uno
-        k = tl.reshape(_norma_rope(fila_k, seq + i + uno, ROPE, 1.0, CON_ROPE), (64,))
-        k8 = _a_fp8(k / ks)
-        v8 = _a_fp8(tl.load(QKV + tok * paso_qkv + (HQ + HKV + h) * 64 + d).to(tl.float32) / vs)
-        destino = tl.load(LOC + tok) * (HKV * 64) + h * 64 + d
-        tl.store(KC + destino, k8, mask=escribe & (d < 64))
-        tl.store(VC + destino, v8, mask=escribe & (d < 64))
-        sc = tl.sum(q * k8.to(tl.float32), 0) * ks * escala_log2
-        sc = tl.where(i <= j, sc, float("-inf"))
-        m_nuevo = tl.maximum(m, sc)
-        alfa = tl.math.exp2(m - m_nuevo)
-        p = tl.math.exp2(sc - m_nuevo)
-        suma = suma * alfa + p
-        acc = acc * alfa + p * v8.to(tl.float32)
-        m = m_nuevo
+    # Las L piezas del bloque, todas a la vez: cada fila j ve las i <= j (siempre dentro de la ventana).
+    li = tl.arange(0, BLOQUE_L)
+    hay_l = li < L
+    i_c = tl.where(hay_l, li, 0)
+    tok = (b * L + i_c).to(tl.int64)
+    k8 = _a_fp8(_norma_rope(QKV + tok * paso_qkv + (HQ + h) * 64, seq + i_c, ROPE, 1.0, CON_ROPE) / ks)
+    v8 = _a_fp8(tl.load(QKV + tok[:, None] * paso_qkv + (HQ + HKV + h) * 64 + d[None, :]).to(tl.float32) / vs)
+    destino = tl.load(LOC + tok)[:, None] * (HKV * 64) + h * 64 + d[None, :]
+    tl.store(KC + destino, k8, mask=escribe & hay_l[:, None])
+    tl.store(VC + destino, v8, mask=escribe & hay_l[:, None])
+    sc = tl.sum(q[None, :] * k8.to(tl.float32), 1) * ks * escala_log2
+    sc = tl.where(hay_l & (li <= j), sc, float("-inf"))
+    m_nuevo = tl.maximum(m, tl.max(sc, 0))
+    alfa = tl.math.exp2(m - m_nuevo)
+    p = tl.math.exp2(sc - m_nuevo)
+    suma = suma * alfa + tl.sum(p, 0)
+    acc = acc * alfa + tl.sum(p[:, None] * v8.to(tl.float32), 0)
 
     o = acc / suma * vs
     o = o * tl.rsqrt(tl.sum(o * o, 0) / 64 + 1e-5)
@@ -246,11 +285,16 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     qk_escala = float(cfg["qk_scale_factor"])
     escala_log2 = float(cfg["sm_scale"]) * LOG2E
 
-    # Pedazos del contexto ya guardado, por la forma (no por los valores): unos dos programas por SM.
+    # Pedazos del contexto ya guardado, por la forma (no por los valores): unos PROGRAMAS_POR_SM programas por SM. En
+    # la ventana (2,047 llaves) bastan pedazos de una vuelta de 64; en el contexto completo, de al menos 4 vueltas de
+    # 128, para que _final no tenga que juntar cientos.
     max_llaves = ventana - 1 if ventana else tabla.shape[1] * pagina
+    bloque_n, vueltas = (64, 1) if max_llaves <= 4096 else (128, 4)
+    par = 2 if hkv % 2 == 0 else 1
     n_bh = batch * hkv
-    n_pedazos = max(1, min(MAX_PEDAZOS, triton.cdiv(max_llaves, BLOQUE_N), triton.cdiv(2 * _n_sms(device), n_bh)))
-    chunk = triton.cdiv(triton.cdiv(max_llaves, n_pedazos), BLOQUE_N) * BLOQUE_N
+    n_pedazos = max(1, min(triton.cdiv(PROGRAMAS_POR_SM * _n_sms(device), n_bh // par),
+                           triton.cdiv(max_llaves, vueltas * bloque_n)))
+    chunk = triton.cdiv(triton.cdiv(max_llaves, n_pedazos), bloque_n) * bloque_n
     n_pedazos = max(1, triton.cdiv(max_llaves, chunk))
     bloque_m = max(16, triton.next_power_of_2(largo * g))
 
@@ -260,14 +304,15 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     out = torch.empty((batch, largo, hq * 64), dtype=torch.bfloat16, device=device)
     k_cache, v_cache = data["k_cache"], data["v_cache"]
 
-    _parcial[(n_pedazos, n_bh)](
+    _parcial[(n_pedazos, n_bh // par)](
         qkv, data["seq_lens"], tabla, k_cache, v_cache, data["k_scale"], rope, mp, lp, ap,
         qkv.stride(0), tabla.stride(0), chunk, n_pedazos, qk_escala, escala_log2,
         HQ=hq, HKV=hkv, L=largo, G=g, PAGINA=pagina, VENTANA=ventana, CON_ROPE=con_rope, BLOQUE_M=bloque_m,
-        BLOQUE_N=BLOQUE_N, EN_CPU=device.type == "cpu", num_warps=4, num_stages=2)
+        BLOQUE_N=bloque_n, PAR=par, EN_CPU=device.type == "cpu", num_warps=8 if bloque_m > 16 else 4, num_stages=2)
     _final[(n_bh * largo * g,)](
         qkv, data["seq_lens"], data["cache_loc"], k_cache, v_cache, data["k_scale"], data["v_scale"], rope,
         mp, lp, ap, out, qkv.stride(0), n_pedazos, qk_escala, escala_log2,
         HQ=hq, HKV=hkv, L=largo, G=g, CON_ROPE=con_rope, BLOQUE_M=bloque_m,
-        BLOQUE_S=triton.next_power_of_2(n_pedazos), num_warps=2)
+        BLOQUE_S=min(BLOQUE_S, triton.next_power_of_2(n_pedazos)), BLOQUE_L=triton.next_power_of_2(largo),
+        num_warps=8 if n_pedazos > 32 else 4)
     return out
