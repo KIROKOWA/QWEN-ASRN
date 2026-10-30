@@ -295,14 +295,15 @@ def convert_tile(st, rows=TILE):
 
 
 def plan(seq_lens, window, n_ctas, min_chunk, w, splits=0):
-    if splits:
-        b, s = w // splits, w % splits
+    if splits:   # v21: pieza 0 = solo las piezas nuevas; 1..splits = llaves guardadas
+        b, s = w // (splits + 1), w % (splits + 1) - 1
         seq = seq_lens[b]
         ln = min(seq, window - 1) if window > 0 else seq
         piece = max(TILE, -(-ln // splits) + TILE - 1) // TILE * TILE
         start = seq - ln
-        return [dict(b=b, lo=min(start + s * piece, seq), hi=min(start + (s + 1) * piece, seq), target=splits,
-                     last=(s == ((ln - 1) // piece if ln > 0 else 0)))]
+        lo = seq if s < 0 else min(start + s * piece, seq)
+        hi = seq if s < 0 else min(start + (s + 1) * piece, seq)
+        return [dict(b=b, lo=lo, hi=hi, target=splits + 1, last=s < 0)]
     lens = [min(s, window - 1) if window > 0 else s for s in seq_lens]
     total = sum(lens)
     chunk = max(min_chunk, -(-total // n_ctas))
@@ -338,7 +339,7 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None, splits=0):
     cnt = np.zeros(B, dtype=int)
     out = np.zeros((B, L, 1024), dtype=np.float32)
     if splits:
-        n_ctas = B * splits
+        n_ctas = B * (splits + 1)
     ctas = list(range(n_ctas)) if orden is None else [w for w in orden if w < n_ctas]
     for w in ctas:
         for sg in plan(d["seq_lens"], window, n_ctas, min_chunk, w, splits):
@@ -564,7 +565,7 @@ def main():
         d = entradas(rng, B, L, ctx, layer, page, kvs, dist, spread)
         kc0, vc0 = d["kc"].copy(), d["vc"].copy()
         splits = -n_ctas if n_ctas < 0 else 0
-        n_ctas = B * splits if splits else n_ctas
+        n_ctas = B * (splits + 1) if splits else n_ctas
         orden = list(rng.permutation(n_ctas))
         out = kernel(d, n_ctas, orden=orden, splits=splits)
         ref = referencia(d, d["kc"], d["vc"])
