@@ -2406,16 +2406,18 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
             const int nrep = p.replicas;
             const int64_t paso_rep = static_cast<int64_t>(p.batch) * L * 16;
             const int64_t base_r = static_cast<int64_t>(b) * L * 16;
-            float* st_acc = reinterpret_cast<float*>(ring);                       // [nrep][CROWS][64]
-            float* st_l = st_acc + nrep * CROWS * 64;                               // [nrep][CROWS]
-            uint8_t* st_g = reinterpret_cast<uint8_t*>(st_l + nrep * CROWS);      // [CROWS][128 B]
+            // verify stages only copy 0 (more do not fit next to its 3-stage ring); copies 1.. are read from L2
+            const int nst = L == 1 ? nrep : 1;
+            float* st_acc = reinterpret_cast<float*>(ring);                       // [nst][CROWS][64]
+            float* st_l = st_acc + nst * CROWS * 64;                                // [nst][CROWS]
+            uint8_t* st_g = reinterpret_cast<uint8_t*>(st_l + nst * CROWS);       // [CROWS][128 B]
 #pragma unroll 1
-            for (int i = tid; i < nrep * CROWS * 16; i += THREADS) {
+            for (int i = tid; i < nst * CROWS * 16; i += THREADS) {
                 const int r = i / (CROWS * 16), rem = i % (CROWS * 16);
                 cp_async16(smem_u32(st_acc + i * 4), p.acc + (r * paso_rep + base_r) * 64 + rem * 4, 16);
             }
 #pragma unroll 1
-            for (int i = tid; i < nrep * CROWS / 4; i += THREADS) {
+            for (int i = tid; i < nst * CROWS / 4; i += THREADS) {
                 const int r = i / (CROWS / 4), rem = i % (CROWS / 4);
                 cp_async16(smem_u32(st_l + i * 4), p.lsum + r * paso_rep + base_r + rem * 4, 16);
             }
@@ -2428,6 +2430,7 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
             cp_async_commit();
             cp_async_wait<0>();
             __syncthreads();
+            auto zero_acc = [&]() {
 #pragma unroll 1
             for (int i = tid; i < nrep * CROWS * 16; i += THREADS) {
                 const int r = i / (CROWS * 16), rem = i % (CROWS * 16);
@@ -2437,6 +2440,8 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
 #pragma unroll 1
             for (int i = tid; i < nrep * CROWS; i += THREADS)
                 __stcg(p.lsum + (i / CROWS) * paso_rep + base_r + i % CROWS, 0.f);
+            };
+            if constexpr (L == 1) zero_acc();
             if (prof && tid == 0) prof[8] = now_ns();
             if constexpr (L == 1) {
 #pragma unroll 1
@@ -2473,7 +2478,8 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
                 const int row = tid >> 1, hf = tid & 1;
                 float l = 0.f;
 #pragma unroll 1
-                for (int r = 0; r < nrep; ++r) l += st_l[r * CROWS + row];
+                for (int r = 1; r < nrep; ++r) l += __ldcg(p.lsum + r * paso_rep + base_r + row);
+                l += st_l[row];
                 const float sc = vscale / l;
                 float o[32];
                 float ss = 0.f;
@@ -2483,7 +2489,7 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
                     float4 x = *reinterpret_cast<const float4*>(st_acc + off);
 #pragma unroll 1
                     for (int r = 1; r < nrep; ++r) {
-                        const float4 y = *reinterpret_cast<const float4*>(st_acc + r * CROWS * 64 + off);
+                        const float4 y = __ldcg(reinterpret_cast<const float4*>(p.acc + (r * paso_rep + base_r) * 64 + off));
                         x.x += y.x; x.y += y.y; x.z += y.z; x.w += y.w;
                     }
                     o[4 * c] = x.x * sc; o[4 * c + 1] = x.y * sc; o[4 * c + 2] = x.z * sc; o[4 * c + 3] = x.w * sc;
@@ -2508,6 +2514,8 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
                     *reinterpret_cast<uint2*>(dst + cc * 4) =
                         make_uint2(*reinterpret_cast<const uint32_t*>(&r01), *reinterpret_cast<const uint32_t*>(&r23));
                 }
+                __syncthreads();   // every copy read before any of it is zeroed
+                zero_acc();
             }
             if (tid == 0) p.cnt[b] = 0;
             if (prof && tid == 0) prof[6] = now_ns();
