@@ -308,6 +308,86 @@ def attend_ver(exp16, a, qv, kh, vh, t0, hi, seq, window, scl, n16, warp):
         mma_f16(a.l, pa, [ONES, ONES])
 
 
+def sw(row, chunk):
+    return row * 128 + ((chunk ^ (row & 7)) << 4)
+
+
+def verify_tile_wg(exp16, warps, q8s, st, t0, hi, seq, window, scl):
+    """v25: los 8 warps (2 warpgroups, uno por cabeza kv) con wgmma: q.k E4M3 [64x64] y p.v f16, en el diseno de
+    registros del acumulador de wgmma (warp w del grupo: filas 16w + g y + 8; columnas 8n + 2tig + {0,1})."""
+    lane = np.arange(32)
+    g, tig = lane >> 2, lane & 3
+    ks, vs = st[:TILE * ROWB], st[TILE * ROWB:]
+    # v -> planos f16 [2][64 llaves][64 dims] SW128, como lo escribe el kernel
+    vpl = np.zeros(2 * 8192, dtype=np.uint8)
+    for tid in range(256):
+        row, quarter = tid >> 2, tid & 3
+        base = (quarter >> 1) * 8192
+        for c in range(2):
+            raw = vs[swz(row, quarter * 2 + c): swz(row, quarter * 2 + c) + 16]
+            vals = E4M3[raw].astype(np.float16).view(np.uint8)
+            ch = ((quarter & 1) * 32 + c * 16) // 8
+            vpl[base + sw(row, ch): base + sw(row, ch) + 16] = vals[:16]
+            vpl[base + sw(row, ch + 1): base + sw(row, ch + 1) + 16] = vals[16:]
+    for h in range(2):
+        Q = np.array([[E4M3[q8s[sw(r, (64 * h + k) >> 4) + (k & 15)]] for k in range(64)] for r in range(64)])
+        K = np.array([[E4M3[ks[swz(key, (64 * h + k) >> 4) + (k & 15)]] for k in range(64)] for key in range(64)])
+        S = Q @ K.T
+        plane = vpl[h * 8192:(h + 1) * 8192]
+        V = np.array([[plane[sw(key, d >> 3) + (d & 7) * 2: sw(key, d >> 3) + (d & 7) * 2 + 2].view(np.float16)[0]
+                       for d in range(64)] for key in range(64)]).astype(np.float64)
+        for wq in range(4):
+            warp = h * 4 + wq
+            a = warps[warp]
+            jg = 2 * wq
+            s = np.zeros((8, 32, 4))
+            for n in range(8):
+                for i in range(4):
+                    s[n][:, i] = S[16 * wq + g + 8 * (i >= 2), 8 * n + 2 * tig + (i & 1)]
+            s = (s.astype(np.float32) * np.float32(scl)).astype(np.float64)
+            if tile_edge(t0, hi, seq, 8, window):
+                for n in range(8):
+                    for i in range(4):
+                        t = t0 + n * 8 + tig * 2 + (i & 1)
+                        pos = seq + (jg if i < 2 else jg + 1)
+                        ok = (t < hi) & (t <= pos) & ((window == 0) | (t > pos - window))
+                        s[n][:, i] = np.where(ok, s[n][:, i], -np.inf)
+            mx0 = shfl_max(s[:, :, 0:2].max(axis=(0, 2)))
+            mx8 = shfl_max(s[:, :, 2:4].max(axis=(0, 2)))
+            up0, up8 = mx0 > a.m0 + TAU, mx8 > a.m8 + TAU
+            if (up0 | up8).any():
+                al0 = np.where(up0, np.exp2(a.m0 - mx0), 1.0)
+                al8 = np.where(up8, np.exp2(a.m8 - mx8), 1.0)
+                a.m0 = np.where(up0, mx0, a.m0)
+                a.m8 = np.where(up8, mx8, a.m8)
+                a.o[:, :, 0:2] *= al0[None, :, None]
+                a.o[:, :, 2:4] *= al8[None, :, None]
+                a.l[:, 0] *= al0
+                a.l[:, 2] *= al8
+
+            def pp(x0, x1, m):
+                with np.errstate(invalid="ignore"):
+                    if exp16:
+                        return f16x2(np.exp2(f16(x0 - m)), np.exp2(f16(x1 - m)))
+                    return f16x2(np.exp2(x0 - m), np.exp2(x1 - m))
+
+            P = np.zeros((16, 64))
+            for kc in range(4):
+                regs = [pp(s[2 * kc][:, 0], s[2 * kc][:, 1], a.m0), pp(s[2 * kc][:, 2], s[2 * kc][:, 3], a.m8),
+                        pp(s[2 * kc + 1][:, 0], s[2 * kc + 1][:, 1], a.m0),
+                        pp(s[2 * kc + 1][:, 2], s[2 * kc + 1][:, 3], a.m8)]
+                for ri, (rr, k0) in enumerate([(0, 0), (8, 0), (0, 8), (8, 8)]):
+                    lo, hi2 = de_f16x2(regs[ri])
+                    for t in range(32):
+                        P[g[t] + rr, 16 * kc + k0 + 2 * tig[t]] = lo[t]
+                        P[g[t] + rr, 16 * kc + k0 + 2 * tig[t] + 1] = hi2[t]
+                    a.l[:, 0 if rr == 0 else 2] += lo + hi2
+            O = P @ V
+            for n in range(8):
+                for i in range(4):
+                    a.o[n][:, i] += O[g + 8 * (i >= 2), 8 * n + 2 * tig + (i & 1)]
+
+
 def convert_tile(st, rows=TILE):
     """E4M3 swizzled (128 B/row) -> f16 swizzled (256 B/row), k y v."""
     kh = np.zeros(TILE * 256, dtype=np.uint8)
@@ -383,6 +463,15 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None, splits=0):
                         x = _rope(x, seq + j, d["cs"])
                     q_s[(j * 16 + head) * 64:(j * 16 + head + 1) * 64] = E4M3[a_e4m3(x)]
             qb = q_s.view(np.uint8)
+            q8s = np.zeros(64 * 128, dtype=np.uint8)
+            for j in range(L if L == 8 else 0):
+                for head in range(16):
+                    x = q_s[(j * 16 + head) * 64:(j * 16 + head + 1) * 64].astype(np.float32)
+                    b8 = a_e4m3(x)
+                    hh, wr = head >> 3, j * 8 + (head & 7)
+                    for dd in range(64):
+                        byte = hh * 64 + dd
+                        q8s[sw(wr, byte >> 4) + (byte & 15)] = b8[dd]
             q32 = q_s.view(np.uint32)
             warps = [Warp() for _ in range(8)]
             qas = []
@@ -414,9 +503,7 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None, splits=0):
                         attend_dec(exp16, warps[warp], qas[warp], st[:TILE * ROWB], st[TILE * ROWB:], t0, sg["hi"],
                                    seq, window, scl, 4, warp)
                 else:
-                    kh, vh = convert_tile(st)
-                    for warp in range(8):
-                        attend_ver(exp16, warps[warp], qas[warp], kh, vh, t0, sg["hi"], seq, window, scl, 4, warp)
+                    verify_tile_wg(exp16, warps, q8s, st, t0, sg["hi"], seq, window, scl)
             if sg["last"]:
                 st = np.zeros(2 * TILE * ROWB, dtype=np.uint8)
                 for i in range(L):
@@ -439,14 +526,15 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None, splits=0):
                         attend_dec(exp16, warps[warp], qas[warp], st[:TILE * ROWB], st[TILE * ROWB:], seq, seq + L,
                                    seq, window, scl, 1, warp)
                 else:
-                    kh, vh = convert_tile(st, 16)
-                    for warp in range(8):
-                        attend_ver(exp16, warps[warp], qas[warp], kh, vh, seq, seq + L, seq, window, scl, 1, warp)
+                    verify_tile_wg(exp16, warps, q8s, st, seq, seq + L, seq, window, scl)
             lane = np.arange(32)
             g, tig = lane >> 2, lane & 3
             for warp in range(8):
                 a = warps[warp]
                 h = warp >> 2
+                if L > 1:   # v25: l parcial por hilo; suma sobre los 4 carriles tig
+                    for col in (0, 2):
+                        a.l[:, col] = a.l[:, col].reshape(8, 4).sum(1).repeat(4)
                 jg = 0 if L == 1 else 2 * (warp & 3)
                 for rows, m, cols, lcol in ((0, a.m0, (0, 1), 0), (1, a.m8, (2, 3), 2)):
                     if rows == 1 and L == 1:
