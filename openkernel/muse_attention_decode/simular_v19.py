@@ -1,4 +1,4 @@
-"""Simula en numpy (sin GPU ni torch) el kernel CUDA de v18 al nivel de los registros de cada hilo: ldmatrix (con y sin
+"""Simula en numpy (sin GPU ni torch) el kernel CUDA de v19 al nivel de los registros de cada hilo: ldmatrix (con y sin
 .trans), mma.sync m16n8k32 E4M3 y m16n8k16 f16 con sus fragmentos tal como los define el PTX ISA, el swizzle de la
 memoria compartida, __byte_perm, el reparto en segmentos, las mascaras, el maximo perezoso, los atomicos y el cierre.
 Compara contra una referencia en float64 hecha aqui (la misma cuenta que reference.py) para atrapar errores de
@@ -174,69 +174,124 @@ class Warp:
         self.m8 = np.full(32, NEG)
 
 
-def attend_tile(L, exp16, a, qa, ks, vs, t0, hi, seq, window, scl, n16, warp):
+def lo16(x):
+    return e4m3x2_f16x2(np.asarray(x, dtype=np.uint32) & 0xFFFF)
+
+
+def hi16(x):
+    return e4m3x2_f16x2(np.asarray(x, dtype=np.uint32) >> 16)
+
+
+def swzh(row, chunk):
+    return row * 256 + ((chunk ^ (row & 7)) << 4)
+
+
+def softmax_block(L, exp16, a, s, tk, edge, hi, seq, jg, j8, window, scl):
+    lane = np.arange(32)
+    tig = lane & 3
+    s = (s.astype(np.float32) * np.float32(scl)).astype(np.float64)
+    if edge:
+        for nb in range(2):
+            for i in range(4):
+                t = tk + nb * 8 + tig * 2 + (i & 1)
+                pos = seq + (jg if i < 2 else j8)
+                ok = (t < hi) & (t <= pos) & ((window == 0) | (t > pos - window))
+                s[nb][:, i] = np.where(ok, s[nb][:, i], -np.inf)
+    mx0 = shfl_max(np.maximum(np.maximum(s[0][:, 0], s[0][:, 1]), np.maximum(s[1][:, 0], s[1][:, 1])))
+    mx8 = np.full(32, NEG)
+    if L > 1:
+        mx8 = shfl_max(np.maximum(np.maximum(s[0][:, 2], s[0][:, 3]), np.maximum(s[1][:, 2], s[1][:, 3])))
+    up0, up8 = mx0 > a.m0 + TAU, mx8 > a.m8 + TAU
+    if (up0 | up8).any():
+        al0 = np.where(up0, np.exp2(a.m0 - mx0), 1.0)
+        al8 = np.where(up8, np.exp2(a.m8 - mx8), 1.0)
+        a.m0 = np.where(up0, mx0, a.m0)
+        a.m8 = np.where(up8, mx8, a.m8)
+        a.o[:, :, 0:2] *= al0[None, :, None]
+        a.o[:, :, 2:4] *= al8[None, :, None]
+        a.l[:, 0:2] *= al0[:, None]
+        a.l[:, 2:4] *= al8[:, None]
+
+    def pp(x0, x1, m):
+        with np.errstate(invalid="ignore"):
+            if exp16:
+                return f16x2(np.exp2(f16(x0 - m)), np.exp2(f16(x1 - m)))
+            return f16x2(np.exp2(x0 - m), np.exp2(x1 - m))
+
+    pa = [pp(s[0][:, 0], s[0][:, 1], a.m0), None, pp(s[1][:, 0], s[1][:, 1], a.m0), None]
+    if L > 1:
+        pa[1] = pp(s[0][:, 2], s[0][:, 3], a.m8)
+        pa[3] = pp(s[1][:, 2], s[1][:, 3], a.m8)
+    else:
+        pa[1] = pa[3] = np.zeros(32, dtype=np.uint32)
+    return pa
+
+
+def tile_edge(t0, hi, seq, L, window):
+    return (t0 + TILE > hi) or (window > 0 and t0 <= seq + L - 1 - window) or (t0 + TILE > seq)
+
+
+ONES = np.full(32, 0x3C003C00, dtype=np.uint32)
+
+
+def attend_dec(exp16, a, qd, ks, vs, t0, hi, seq, window, scl, n16, warp):
+    lane = np.arange(32)
+    h, kb = warp >> 2, warp & 3
+    if kb >= n16:
+        return
+    mi, ri = lane >> 3, lane & 7
+    edge = tile_edge(t0, hi, seq, 1, window)
+    z = np.zeros(32, dtype=np.uint32)
+    s = np.zeros((2, 32, 4))
+    for nb in range(2):
+        kf = ldsm_x4(ks, swz(kb * 16 + nb * 8 + ri, h * 4 + mi))
+        for c in range(4):
+            mma_f16(s[nb], [qd[c][0], z, qd[c][1], z], [lo16(kf[c]), hi16(kf[c])])
+    pa = softmax_block(1, exp16, a, s, t0 + kb * 16, edge, hi, seq, 0, 0, window, scl)
+    for half in range(2):
+        vr = ldsm_x4(vs, swz(kb * 16 + (mi & 1) * 8 + ri, h * 4 + half * 2 + (mi >> 1)), trans=True)
+        for e in range(2):
+            db = half * 2 + e
+            lo, hi8 = vr[2 * e], vr[2 * e + 1]
+            mma_f16(a.o[2 * db], pa, [e4m3x2_f16x2(byte_perm(lo, 0x0020)), e4m3x2_f16x2(byte_perm(hi8, 0x0020))])
+            mma_f16(a.o[2 * db + 1], pa, [e4m3x2_f16x2(byte_perm(lo, 0x0031)), e4m3x2_f16x2(byte_perm(hi8, 0x0031))])
+    mma_f16(a.l, pa, [ONES, ONES])
+
+
+def attend_ver(exp16, a, qv, kh, vh, t0, hi, seq, window, scl, n16, warp):
     lane = np.arange(32)
     h = warp >> 2
-    g, tig, mi, ri = lane >> 2, lane & 3, lane >> 3, lane & 7
-    kb_first = (warp & 3) if L == 1 else 0
-    kb_end = (warp & 3) + 1 if L == 1 else n16
-    if kb_first >= n16:
-        return
-    jg = 0 if L == 1 else 2 * (warp & 3)
-    j8 = jg + 1
-    edge = (t0 + TILE > hi) or (window > 0 and t0 <= seq + L - 1 - window) or (t0 + TILE > seq)
-    for kb in range(kb_first, kb_end):
-        kf = [ldsm_x4(ks, swz(kb * 16 + nb * 8 + ri, h * 4 + mi)) for nb in range(2)]
+    jg = 2 * (warp & 3)
+    mi, ri = lane >> 3, lane & 7
+    edge = tile_edge(t0, hi, seq, 8, window)
+    for kb in range(n16):
         s = np.zeros((2, 32, 4))
         for nb in range(2):
-            mma_fp8(s[nb], qa[0], kf[nb][0:2])
-            mma_fp8(s[nb], qa[1], kf[nb][2:4])
-        s = (s.astype(np.float32) * np.float32(scl)).astype(np.float64)
-        if edge:
-            for nb in range(2):
-                for i in range(4):
-                    t = t0 + kb * 16 + nb * 8 + tig * 2 + (i & 1)
-                    pos = seq + (jg if i < 2 else j8)
-                    ok = (t < hi) & (t <= pos) & ((window == 0) | (t > pos - window))
-                    s[nb][:, i] = np.where(ok, s[nb][:, i], -np.inf)
-        mx0 = shfl_max(np.maximum(np.maximum(s[0][:, 0], s[0][:, 1]), np.maximum(s[1][:, 0], s[1][:, 1])))
-        mx8 = np.full(32, NEG)
-        if L > 1:
-            mx8 = shfl_max(np.maximum(np.maximum(s[0][:, 2], s[0][:, 3]), np.maximum(s[1][:, 2], s[1][:, 3])))
-        up0, up8 = mx0 > a.m0 + TAU, mx8 > a.m8 + TAU
-        if (up0 | up8).any():
-            al0 = np.where(up0, np.exp2(a.m0 - mx0), 1.0)
-            al8 = np.where(up8, np.exp2(a.m8 - mx8), 1.0)
-            a.m0 = np.where(up0, mx0, a.m0)
-            a.m8 = np.where(up8, mx8, a.m8)
-            a.o[:, :, 0:2] *= al0[None, :, None]
-            a.o[:, :, 2:4] *= al8[None, :, None]
-            a.l[:, 0:2] *= al0[:, None]
-            a.l[:, 2:4] *= al8[:, None]
+            for half in range(2):
+                kf = ldsm_x4(kh, swzh(kb * 16 + nb * 8 + ri, h * 8 + half * 4 + mi))
+                mma_f16(s[nb], qv[2 * half], kf[0:2])
+                mma_f16(s[nb], qv[2 * half + 1], kf[2:4])
+        pa = softmax_block(8, exp16, a, s, t0 + kb * 16, edge, hi, seq, jg, jg + 1, window, scl)
+        for j in range(4):
+            vb = ldsm_x4(vh, swzh(kb * 16 + (mi & 1) * 8 + ri, h * 8 + 2 * j + (mi >> 1)), trans=True)
+            mma_f16(a.o[2 * j], pa, vb[0:2])
+            mma_f16(a.o[2 * j + 1], pa, vb[2:4])
+        mma_f16(a.l, pa, [ONES, ONES])
 
-        def pp(x0, x1, m):
-            with np.errstate(invalid="ignore"):
-                if exp16:
-                    d0, d1 = f16(x0 - m), f16(x1 - m)
-                    return f16x2(np.exp2(d0), np.exp2(d1))
-                return f16x2(np.exp2(x0 - m), np.exp2(x1 - m))
 
-        pa = [pp(s[0][:, 0], s[0][:, 1], a.m0), None, pp(s[1][:, 0], s[1][:, 1], a.m0), None]
-        if L > 1:
-            pa[1] = pp(s[0][:, 2], s[0][:, 3], a.m8)
-            pa[3] = pp(s[1][:, 2], s[1][:, 3], a.m8)
-        else:
-            pa[1] = pa[3] = np.zeros(32, dtype=np.uint32)
-        for half in range(2):
-            vr = ldsm_x4(vs, swz(kb * 16 + (mi & 1) * 8 + ri, h * 4 + half * 2 + (mi >> 1)), trans=True)
-            for e in range(2):
-                db = half * 2 + e
-                lo, hi8 = vr[2 * e], vr[2 * e + 1]
-                mma_f16(a.o[2 * db], pa, [e4m3x2_f16x2(byte_perm(lo, 0x0020)), e4m3x2_f16x2(byte_perm(hi8, 0x0020))])
-                mma_f16(a.o[2 * db + 1], pa,
-                        [e4m3x2_f16x2(byte_perm(lo, 0x0031)), e4m3x2_f16x2(byte_perm(hi8, 0x0031))])
-        ones = np.full(32, 0x3C003C00, dtype=np.uint32)
-        mma_f16(a.l, pa, [ones, ones])
+def convert_tile(st, rows=TILE):
+    """E4M3 swizzled (128 B/row) -> f16 swizzled (256 B/row), k y v."""
+    kh = np.zeros(TILE * 256, dtype=np.uint8)
+    vh = np.zeros(TILE * 256, dtype=np.uint8)
+    for kv, dst in ((0, kh), (1, vh)):
+        src = st[kv * TILE * ROWB:(kv + 1) * TILE * ROWB]
+        for row in range(rows):
+            for chunk in range(8):
+                raw = src[swz(row, chunk): swz(row, chunk) + 16]
+                vals = E4M3[raw].astype(np.float16).view(np.uint8)
+                dst[swzh(row, 2 * chunk): swzh(row, 2 * chunk) + 16] = vals[:16]
+                dst[swzh(row, 2 * chunk + 1): swzh(row, 2 * chunk + 1) + 16] = vals[16:]
+    return kh, vh
 
 
 def plan(seq_lens, window, n_ctas, min_chunk, w):
@@ -280,31 +335,31 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None):
             b, seq = sg["b"], d["seq_lens"][sg["b"]]
             n_tiles = -(-(sg["hi"] - sg["lo"]) // TILE)
             # q -> E4M3 [j][head][64]
-            q_s = np.zeros(L * 16 * 64, dtype=np.uint8)
+            q_s = np.zeros(L * 16 * 64, dtype=np.float16)
             for j in range(L):
                 for head in range(16):
                     x = d["qkv"][b, j, head * 64:(head + 1) * 64].astype(np.float32)
                     x = x / np.sqrt(np.float32(np.mean(x.astype(np.float64) ** 2) + EPS))
                     if rope:
                         x = _rope(x, seq + j, d["cs"])
-                    q_s[(j * 16 + head) * 64:(j * 16 + head + 1) * 64] = a_e4m3(x)
+                    q_s[(j * 16 + head) * 64:(j * 16 + head + 1) * 64] = E4M3[a_e4m3(x)]
+            qb = q_s.view(np.uint8)
+            q32 = q_s.view(np.uint32)
             warps = [Warp() for _ in range(8)]
             qas = []
             lane = np.arange(32)
-            mi, ri = lane >> 3, lane & 7
+            g_, tig_, mi, ri = lane >> 2, lane & 3, lane >> 3, lane & 7
             for warp in range(8):
                 h = warp >> 2
-                qa = []
-                for ks in range(2):
-                    if L == 1:
-                        r = ldsm_x4(q_s, (h * 8 + ri) * 64 + (ks * 2 + (mi >> 1)) * 16)
-                        z = np.zeros(32, dtype=np.uint32)
-                        qa.append([r[0], z, r[2], z])
-                    else:
-                        rr = (mi & 1) * 8 + ri
-                        tok = 2 * (warp & 3) + (rr >> 3)
-                        qa.append(ldsm_x4(q_s, (tok * 16 + h * 8 + (rr & 7)) * 64 + (ks * 2 + (mi >> 1)) * 16))
-                qas.append(qa)
+                if L == 1:
+                    base = (h * 8 + g_) * 32   # uint32 por fila
+                    qas.append([[q32[base + (16 * c + 4 * tig_) // 2], q32[base + (16 * c + 4 * tig_ + 2) // 2]]
+                                for c in range(4)])
+                else:
+                    rr = (mi & 1) * 8 + ri
+                    tok = 2 * (warp & 3) + (rr >> 3)
+                    base = (tok * 16 + h * 8 + (rr & 7)) * 128
+                    qas.append([ldsm_x4(qb, base + (2 * st_ + (mi >> 1)) * 16) for st_ in range(4)])
             for it in range(n_tiles):
                 st = np.zeros(2 * TILE * ROWB, dtype=np.uint8)
                 for rc in range(TILE):
@@ -314,9 +369,15 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None):
                         for c in range(8):
                             st[swz(rc, c): swz(rc, c) + 16] = kc[r, c * 16:(c + 1) * 16]
                             st[TILE * ROWB + swz(rc, c): TILE * ROWB + swz(rc, c) + 16] = vc[r, c * 16:(c + 1) * 16]
-                for warp in range(8):
-                    attend_tile(L, exp16, warps[warp], qas[warp], st[:TILE * ROWB], st[TILE * ROWB:],
-                                sg["lo"] + it * TILE, sg["hi"], seq, window, scl, 4, warp)
+                t0 = sg["lo"] + it * TILE
+                if L == 1:
+                    for warp in range(8):
+                        attend_dec(exp16, warps[warp], qas[warp], st[:TILE * ROWB], st[TILE * ROWB:], t0, sg["hi"],
+                                   seq, window, scl, 4, warp)
+                else:
+                    kh, vh = convert_tile(st)
+                    for warp in range(8):
+                        attend_ver(exp16, warps[warp], qas[warp], kh, vh, t0, sg["hi"], seq, window, scl, 4, warp)
             if sg["last"]:
                 st = np.zeros(2 * TILE * ROWB, dtype=np.uint8)
                 for i in range(L):
@@ -334,9 +395,14 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None):
                             st[TILE * ROWB + swz(i, byte >> 4) + (byte & 15)] = v8[dd]
                         kc[loc, hh * 64:(hh + 1) * 64] = k8
                         vc[loc, hh * 64:(hh + 1) * 64] = v8
-                for warp in range(8):
-                    attend_tile(L, exp16, warps[warp], qas[warp], st[:TILE * ROWB], st[TILE * ROWB:], seq, seq + L,
-                                seq, window, scl, 1, warp)
+                if L == 1:
+                    for warp in range(8):
+                        attend_dec(exp16, warps[warp], qas[warp], st[:TILE * ROWB], st[TILE * ROWB:], seq, seq + L,
+                                   seq, window, scl, 1, warp)
+                else:
+                    kh, vh = convert_tile(st, 16)
+                    for warp in range(8):
+                        attend_ver(exp16, warps[warp], qas[warp], kh, vh, seq, seq + L, seq, window, scl, 1, warp)
             lane = np.arange(32)
             g, tig = lane >> 2, lane & 3
             for warp in range(8):
@@ -352,11 +418,17 @@ def kernel(d, n_ctas, min_chunk=64, exp16=None, orden=None):
                             continue
                         head = h * 8 + g[t]
                         j = jg + rows
-                        for db in range(4):
-                            base = db * 16 + tig[t] * 4
-                            vals = [a.o[2 * db][t, cols[0]], a.o[2 * db + 1][t, cols[0]], a.o[2 * db][t, cols[1]],
-                                    a.o[2 * db + 1][t, cols[1]]]
-                            acc[b, j, head, base:base + 4] += np.array(vals) * f[t]
+                        if L == 1:
+                            for db in range(4):
+                                base = db * 16 + tig[t] * 4
+                                vals = [a.o[2 * db][t, cols[0]], a.o[2 * db + 1][t, cols[0]],
+                                        a.o[2 * db][t, cols[1]], a.o[2 * db + 1][t, cols[1]]]
+                                acc[b, j, head, base:base + 4] += np.array(vals) * f[t]
+                        else:
+                            for n in range(8):
+                                base = n * 8 + tig[t] * 2
+                                acc[b, j, head, base:base + 2] += np.array([a.o[n][t, cols[0]],
+                                                                            a.o[n][t, cols[1]]]) * f[t]
                         if tig[t] == 0:
                             lsum[b, j, head] += a.l[t, lcol] * f[t]
             cnt[b] += 1
