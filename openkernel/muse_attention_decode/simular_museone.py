@@ -259,19 +259,48 @@ def attend_dec(exp16, a, qd, ks, vs, t0, hi, seq, window, scl, n16, warp):
 
 
 def attend_ver(exp16, a, qv, kh, vh, t0, hi, seq, window, scl, n16, warp):
+    """v24: q.k de todo el tile, una revision del maximo, despues p.v."""
     lane = np.arange(32)
     h = warp >> 2
     jg = 2 * (warp & 3)
-    mi, ri = lane >> 3, lane & 7
+    tig, mi, ri = lane & 3, lane >> 3, lane & 7
     edge = tile_edge(t0, hi, seq, 8, window)
+    s = np.zeros((2 * n16, 32, 4))
+    for nb in range(2 * n16):
+        for half in range(2):
+            kf = ldsm_x4(kh, swzh(nb * 8 + ri, h * 8 + half * 4 + mi))
+            mma_f16(s[nb], qv[2 * half], kf[0:2])
+            mma_f16(s[nb], qv[2 * half + 1], kf[2:4])
+    s = (s.astype(np.float32) * np.float32(scl)).astype(np.float64)
+    if edge:
+        for nb in range(2 * n16):
+            for i in range(4):
+                t = t0 + nb * 8 + tig * 2 + (i & 1)
+                pos = seq + (jg if i < 2 else jg + 1)
+                ok = (t < hi) & (t <= pos) & ((window == 0) | (t > pos - window))
+                s[nb][:, i] = np.where(ok, s[nb][:, i], -np.inf)
+    mx0 = shfl_max(s[:, :, 0:2].max(axis=(0, 2)))
+    mx8 = shfl_max(s[:, :, 2:4].max(axis=(0, 2)))
+    up0, up8 = mx0 > a.m0 + TAU, mx8 > a.m8 + TAU
+    if (up0 | up8).any():
+        al0 = np.where(up0, np.exp2(a.m0 - mx0), 1.0)
+        al8 = np.where(up8, np.exp2(a.m8 - mx8), 1.0)
+        a.m0 = np.where(up0, mx0, a.m0)
+        a.m8 = np.where(up8, mx8, a.m8)
+        a.o[:, :, 0:2] *= al0[None, :, None]
+        a.o[:, :, 2:4] *= al8[None, :, None]
+        a.l[:, 0:2] *= al0[:, None]
+        a.l[:, 2:4] *= al8[:, None]
+
+    def pp(x0, x1, m):
+        with np.errstate(invalid="ignore"):
+            if exp16:
+                return f16x2(np.exp2(f16(x0 - m)), np.exp2(f16(x1 - m)))
+            return f16x2(np.exp2(x0 - m), np.exp2(x1 - m))
+
     for kb in range(n16):
-        s = np.zeros((2, 32, 4))
-        for nb in range(2):
-            for half in range(2):
-                kf = ldsm_x4(kh, swzh(kb * 16 + nb * 8 + ri, h * 8 + half * 4 + mi))
-                mma_f16(s[nb], qv[2 * half], kf[0:2])
-                mma_f16(s[nb], qv[2 * half + 1], kf[2:4])
-        pa = softmax_block(8, exp16, a, s, t0 + kb * 16, edge, hi, seq, jg, jg + 1, window, scl)
+        pa = [pp(s[2 * kb][:, 0], s[2 * kb][:, 1], a.m0), pp(s[2 * kb][:, 2], s[2 * kb][:, 3], a.m8),
+              pp(s[2 * kb + 1][:, 0], s[2 * kb + 1][:, 1], a.m0), pp(s[2 * kb + 1][:, 2], s[2 * kb + 1][:, 3], a.m8)]
         for j in range(4):
             vb = ldsm_x4(vh, swzh(kb * 16 + (mi & 1) * 8 + ri, h * 8 + 2 * j + (mi >> 1)), trans=True)
             mma_f16(a.o[2 * j], pa, vb[0:2])
