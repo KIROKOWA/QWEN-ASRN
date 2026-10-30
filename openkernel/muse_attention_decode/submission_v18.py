@@ -2230,11 +2230,14 @@ def _modulo_v18():
                              "bool con_rope, int64_t n_ctas, int64_t min_chunk, double scale_log2, double c_ref);"),
                 cuda_sources=_V18_FUENTE + _V18_ANFITRION.replace("V18_CASOS", _v18_casos()),
                 functions=["v18_launch"],
-                extra_cflags=["-O3", "-std=c++17"],
-                extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
+                extra_cflags=["-O3", "-std=c++20"],   # el torch del juez exige C++20 (con c++17 no compila)
+                extra_cuda_cflags=["-O3", "-std=c++20"], verbose=False)
             print("v18: kernel CUDA compilado", flush=True)
         except Exception as error:
-            print(f"v18: el kernel CUDA no compilo, sigo con v17: {type(error).__name__}: {error}"[-6000:], flush=True)
+            texto = str(error)
+            errores = [l for l in texto.splitlines() if "error" in l.lower()][:20]
+            print(f"v18: el kernel CUDA no compilo, sigo con v17: {type(error).__name__}\n" + "\n".join(errores)[:5000]
+                  + "\n--- final ---\n" + texto[-1500:], flush=True)
             _V18["modulo"] = None
     return _V18["modulo"]
 

@@ -47,7 +47,7 @@ def main():
     prog = ctypes.c_void_p()
     assert nvrtc.nvrtcCreateProgram(ctypes.byref(prog), fuente.encode(), b"k.cu", 0, None, None) == 0
     # las macros que pone load_inline de PyTorch
-    opciones = [b"--gpu-architecture=compute_90a", b"-std=c++17", b"-default-device",
+    opciones = [b"--gpu-architecture=compute_90a", b"-std=c++20", b"-default-device",
                 b"-D__CUDA_NO_HALF_OPERATORS__", b"-D__CUDA_NO_HALF_CONVERSIONS__",
                 b"-D__CUDA_NO_BFLOAT16_CONVERSIONS__", b"-D__CUDA_NO_HALF2_OPERATORS__", b"-I" + incluir.encode()]
     res = nvrtc.nvrtcCompileProgram(prog, len(opciones), (ctypes.c_char_p * len(opciones))(*opciones))
