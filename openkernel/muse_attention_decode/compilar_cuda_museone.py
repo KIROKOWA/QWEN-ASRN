@@ -38,7 +38,8 @@ def main():
     fuente_cuda = ast.literal_eval(valores["_V18_FUENTE"])
     ns = re.search(r"namespace (m\d+)", fuente_cuda).group(1)
     config = ast.literal_eval(valores["_V18_CONFIG"])
-    instancias = [f"{l}, {pag}, {str(rope).lower()}, {e}, {m}, {str(x16).lower()}"
+    extra = (lambda rope: f", {str(rope).lower()}") if "bool CLUSTER>" in fuente_cuda else (lambda rope: "")
+    instancias = [f"{l}, {pag}, {str(rope).lower()}, {e}, {m}, {str(x16).lower()}{extra(rope)}"
                   for l, (e, m, x16) in config.items() for pag in (1, 64) for rope in (False, True)]
     nvrtc = ctypes.CDLL(_arg("--nvrtc", None) or _buscar("nvidia/cuda_nvrtc/lib/libnvrtc.so*"))
     ptxas = _arg("--ptxas", None) or _buscar("nvidia/cuda_nvcc/bin/ptxas")
