@@ -1,9 +1,11 @@
 # okc: problem=muse_attention_decode
-"""MuseOne11 (v27): MuseOne10 (1.65x) con el prologo de K/V partido.
+"""MuseOne11: MuseOne10 con la etapa 0 del anillo emitida antes de q y el resto despues.
 
-Antes cada hilo emitia las 5 etapas del anillo (20 cp.async) antes de armar q, y la emision se trababa hasta que las
-primeras se vaciaban: con 32 peticiones q quedaba lista a los 5.4 us y el computo no se solapaba con la llegada de
-los datos. Ahora se emite la etapa 0, se arma q y despues el resto del prologo. Lo demas igual que MuseOne10.
+- La fila de RoPE de q (cos | sin) se pide antes que las filas del cache: antes salia detras de todo el anillo de
+  K/V y con 16-32 peticiones q quedaba lista a los 3.5-5.7 us, con los datos ya esperando.
+- El cierre de cada segmento usa el semaforo de CUTLASS: bar.sync + un solo atom.acq_rel.gpu del hilo 0, en vez de
+  fence.sc (__threadfence) en los 256 hilos y otro mas en el CTA que cierra.
+Verify igual que MuseOne9 (wgmma).
 """
 from typing import TypedDict
 
@@ -1538,9 +1540,7 @@ def _kernel_v17(data: Inputs) -> torch.Tensor:
     return _kernel_v16(data)
 
 
-_V18_FUENTE = r"""// v27: the KV prologue issues only stage 0 before building q and the rest after: 20 cp.async per thread stalled the
-// issue (and q behind it) until the first ones drained; q was ready at 5.4 us with 32 requests.
-// v26: decode: the RoPE row of q is requested before the KV prologue (it no longer queues behind it), and the
+_V18_FUENTE = r"""// v26: decode: the RoPE row of q is requested before the KV prologue (it no longer queues behind it), and the
 // end-of-segment handshake is CUTLASS's semaphore (bar.sync + one atom.acq_rel.gpu) instead of fence.sc in every thread.
 // v25: verify (64 query rows per kv head) on Hopper's wgmma: q.k in E4M3 straight from the gathered rows, p.v in f16.
 // v22: Muse Spark Open gated attention (TP8: 16 query heads, 2 kv heads of 64) in ONE kernel launch per call.
@@ -1573,7 +1573,7 @@ typedef unsigned long long uint64_t;
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-namespace m27 {
+namespace m26 {
 
 constexpr int THREADS = 256;
 constexpr int TILE = 64;                 // tokens per ring tile
@@ -2231,7 +2231,7 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
             }
         }
 #pragma unroll
-        for (int s = 1; s < STAGES - 1; ++s) {   // the rest of the prologue, now that q is built
+        for (int s = 1; s < STAGES - 1; ++s) {
             if (s < n_tiles) issue(s, rows[s]);
             cp_async_commit();
         }
@@ -2463,7 +2463,7 @@ __global__ void __launch_bounds__(THREADS, MINB) attention(const Params p) {
     }
 }
 
-}  // namespace m27
+}  // namespace m26
 """
 
 # (L, PAGINA, ROPE, ETAPAS, CTAS_POR_SM, EXP16): las instancias que lanza el anfitrion. Decode lee y poco calcula: dos
@@ -2479,16 +2479,16 @@ _V18_ANFITRION = r"""
 #include <c10/cuda/CUDAException.h>
 
 template <int L, int PAGE, bool ROPE, int STAGES, int MINB, bool EXP16>
-static void v18_run(const m27::Params& p, int grid, cudaStream_t stream) {
+static void v18_run(const m26::Params& p, int grid, cudaStream_t stream) {
     // verify: + f16 v planes (16 KB) + E4M3 queries (8 KB); + 1 KB to align the wgmma buffers to 1024 bytes
-    constexpr int smem = STAGES * m27::STAGE_BYTES + (L > 1 ? m27::TILE_H + 8192 : 0) + 1024;
+    constexpr int smem = STAGES * m26::STAGE_BYTES + (L > 1 ? m26::TILE_H + 8192 : 0) + 1024;
     static bool listo = false;
     if (!listo) {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(m27::attention<L, PAGE, ROPE, STAGES, MINB, EXP16>,
+        C10_CUDA_CHECK(cudaFuncSetAttribute(m26::attention<L, PAGE, ROPE, STAGES, MINB, EXP16>,
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         listo = true;
     }
-    m27::attention<L, PAGE, ROPE, STAGES, MINB, EXP16><<<grid, m27::THREADS, smem, stream>>>(p);
+    m26::attention<L, PAGE, ROPE, STAGES, MINB, EXP16><<<grid, m26::THREADS, smem, stream>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2498,7 +2498,7 @@ void v18_launch(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor table, 
                 int64_t page, int64_t window, bool con_rope, int64_t n_ctas, int64_t min_chunk, double scale_log2,
                 double c_ref, int64_t splits, int64_t replicas, torch::Tensor prof) {
     const c10::cuda::CUDAGuard guard(qkv.device());
-    m27::Params p;
+    m26::Params p;
     p.qkv = reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr());
     p.qkv_stride = qkv.stride(0);
     p.seq_lens = seq_lens.data_ptr<int>();
@@ -2553,7 +2553,7 @@ def _modulo_v18():
         try:
             from torch.utils.cpp_extension import load_inline
             _V18["modulo"] = load_inline(
-                name="muse_v27",
+                name="muse_v26b",
                 cpp_sources=("void v18_launch(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor table, "
                              "torch::Tensor kc, torch::Tensor vc, torch::Tensor k_scale, torch::Tensor v_scale, "
                              "torch::Tensor cache_loc, torch::Tensor rope, torch::Tensor acc, torch::Tensor lsum, "
@@ -2566,7 +2566,7 @@ def _modulo_v18():
                 # wgmma solo existe en sm_90a: sin esta bandera torch compila para sm_90 y ptxas rechaza wgmma. Con una
                 # bandera "arch" propia torch no agrega la suya.
                 extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
-            print("v27: kernel CUDA compilado", flush=True)
+            print("v26: kernel CUDA compilado", flush=True)
         except Exception as error:
             texto = str(error)
             errores = [l for l in texto.splitlines() if "error" in l.lower()][:20]
@@ -2656,7 +2656,7 @@ def _v20_imprimir(clave, grid, copias, prof):
         x = (p[m, i] - t0).double() / 1000
         return f"{x.median().item():.1f}/{x.max().item():.1f}"
     con_trabajo = vivos & (p[:, 7] > 0)
-    print(f"v27 perfil B={clave[0]} L={clave[1]} ventana={clave[2]} pag={clave[3]} grid={grid} copias={copias} "
+    print(f"v26 perfil B={clave[0]} L={clave[1]} ventana={clave[2]} pag={clave[3]} grid={grid} copias={copias} "
           f"ctas_con_trabajo={int(con_trabajo.sum())} | entrar {fase(0)} plan {fase(1)} q {fase(2)} bucle {fase(3)} "
           f"nuevas {fase(4)} atomico {fase(5)} cierre {fase(6)} | span {(int(p[:, 6].max()) - t0) / 1000:.1f} us",
           flush=True)
