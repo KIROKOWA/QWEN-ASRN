@@ -2546,7 +2546,9 @@ def _modulo_v18():
                 cuda_sources=_V18_FUENTE + _V18_ANFITRION.replace("V18_CASOS", _v18_casos()),
                 functions=["v18_launch"],
                 extra_cflags=["-O3", "-std=c++20"],   # el torch del juez exige C++20 (con c++17 no compila)
-                extra_cuda_cflags=["-O3", "-std=c++20"], verbose=False)
+                # wgmma solo existe en sm_90a: sin esta bandera torch compila para sm_90 y ptxas rechaza wgmma. Con una
+                # bandera "arch" propia torch no agrega la suya.
+                extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_90a,code=sm_90a"], verbose=False)
             print("v25: kernel CUDA compilado", flush=True)
         except Exception as error:
             texto = str(error)
