@@ -50,6 +50,13 @@
   1.6 µs), y la barrera global espera al más lento. Los CTAs lentos son siempre los de blockIdx ≥ 132.
 - MuseOne19 también: en verify completa (plano q_len 8, un par kv) la primera mitad de la malla toma W0_L8 = 1135/2048
   de cada par de partes (vjeux barrió 1130–1140 con registro por SM; aquí sin registro, por la mitad de la malla).
+- **MuseOne19 (check `2f86cb74dad94696`, 2.553×): los dos cambios perdieron** (kernel, µs, contra MuseOne17):
+  - copias privadas: v1s 8.1 contra 6.1–6.5, v16s 11.5 contra 10.7–11.0, v32s 15.1 contra 14.0–14.5. Leer y poner
+    en cero 33 copias (1 MB de lecturas + 1 MB de ceros) cuesta más que los atómicos que ahorra.
+  - reparto 1135/2048: v16f 105.8 contra 100–101, v32f 195.9 contra 184–186. O el par de CTAs de cada SM no es
+    (c, c + 132) en todos los SMs, o el SM ya está ocupado igual con partes iguales; sin registro no sirve.
+  - controles: d16f 83.2 y d32f 158.5 (algo mejores que antes: otra máquina / ruido).
+  - MuseOne17 sigue siendo la mejor versión.
 
 ## Prioridades (de ANALISIS_MuseOne17.md)
 
