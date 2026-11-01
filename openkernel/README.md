@@ -70,6 +70,8 @@ Apache 2.0, la misma licencia de este repositorio.
 | `submission_v13.py` | CUDA con 8 warps por bloque (uno por cabeza kv y grupo de llaves), `p·v` traspuesto (acumuladores sin relleno), `q` desde memoria compartida, direcciones recalculadas por vuelta: **80 registros, sin derrames, 3 bloques por SM (24 warps)** | 1.26×: empata con Triton (160/320 µs contra 156/306) |
 | `submission_v14.py` | CUDA: `q·k` en FP8 directo (`mma m16n8k32.e4m3`, las llaves no se convierten), `v` a bf16 una vez por vuelta y fragmentos con `ldmatrix.trans`; 71 registros, 3 bloques por SM | **1.325×** (decode 16/32 completo: 139/261 µs, contra 156/306 de Triton) |
 | `submission_v15.py` | v14 + verify completo (16 y 32 peticiones) en CUDA: cada warp toma 16 consultas reales y las 64 llaves de la vuelta, `p` pasa de registro a registro (como FA2), sin suma entre warps; 80 registros, 3 bloques por SM | por medir |
+| MuseOne14 / MuseOne16 | kernel propio (CUDA, wgmma en verify) | 1.686× / ~1.67× |
+| `MuseOne17.py` | base pública de vjeux (Apache-2.0, atribución en el encabezado), sin cambios en el CUDA; análisis por forma en [`ANALISIS_MuseOne17.md`](muse_attention_decode/ANALISIS_MuseOne17.md) | 2.65× esperado (mismo archivo: 2.653× y 2.603× en el juez para otros equipos) |
 
 `compilar_cuda.py` compila el CUDA de una versión para sm_90a sin GPU (NVRTC + `ptxas`), y `simular_cuda.py` simula el kernel carril por carril en numpy (fragmentos de `mma.sync`, swizzle, anillo) contra un cálculo directo.
 
