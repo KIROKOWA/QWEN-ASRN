@@ -110,7 +110,7 @@ def status(job, carpeta="."):
         json.dump(r, f, indent=1, ensure_ascii=False)
     _resumen(r)
     if r.get("log_tail"):
-        print("--- lo que imprimio la corrida (final) ---\n" + r["log_tail"][-3000:])
+        print("--- lo que imprimio la corrida (final) ---\n" + r["log_tail"])
     print(f"(todo el resultado en {salida})")
 
 
