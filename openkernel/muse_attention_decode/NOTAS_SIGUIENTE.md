@@ -45,6 +45,11 @@
 - MuseOne19: verify con ventana (cierre cooperativo) con una copia privada por split escrita con stores
   (`st.global.cg.v4`) en vez de `red.v4`; el cierre reparte las copias de cada fila entre G grupos de hilos
   (v1s: 33 copias, G = 8, ≤ 2 viajes al L2; v16s: 8 copias, G = 2; v32s: 4 copias, camino de antes).
+- diag2 de verify completa (mismo check): la vuelta cuesta lo mismo que en decode (1.05–1.18 contra 1.02–1.06 µs).
+  El exceso de verify es el 2º CTA de cada SM: termina 8.5 µs (v16f) y 10–16 µs (v32f) después del 1º (en decode,
+  1.6 µs), y la barrera global espera al más lento. Los CTAs lentos son siempre los de blockIdx ≥ 132.
+- MuseOne19 también: en verify completa (plano q_len 8, un par kv) la primera mitad de la malla toma W0_L8 = 1135/2048
+  de cada par de partes (vjeux barrió 1130–1140 con registro por SM; aquí sin registro, por la mitad de la malla).
 
 ## Prioridades (de ANALISIS_MuseOne17.md)
 

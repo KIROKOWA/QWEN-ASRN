@@ -1,7 +1,8 @@
 # okc: problem=muse_attention_decode
 # MuseOne17 (KIROKOWA / QWEN-ASRN). Base: vjeux, https://github.com/vjeux/okc-2026 (commit f35a41e),
 # muse_attention_decode.py, Apache License 2.0. Portions Copyright vjeux; this notice retained.
-# MuseOne19: verify con ventana (cierre cooperativo) escribe copias privadas por CTA en vez de atomicos al L2.
+# MuseOne19: verify con ventana: copias privadas por CTA en vez de atomicos al L2; verify completa: reparto
+# desigual entre los dos CTAs de cada SM (la primera mitad de la malla tiene la prioridad del planificador).
 """Gated attention decode for Muse Spark Open: one fused CUDA kernel per call.
 
 Algorithm
@@ -187,6 +188,7 @@ struct Params {
   int lrb;              // log2(row bytes of a cache row: Hkv * 64)
   int off32;            // both caches below 4 GB (32-bit cache offsets); else the 64-bit path
   unsigned ns_magic;    // ceil(2^32 / n_splits) (0: n_splits == 1)
+  int w0;               // MuseOne19: plano q_len 8, parte (/2048) de la primera mitad de la malla (0: reparto igual)
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
@@ -2764,6 +2766,15 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   if constexpr (fpart) {   // (computed by warp 0)
     cs = S.fcs;
     ce = S.fce;
+  } else if (L == 8 && p.w0 > 0 && (G & 1) == 0 && gridDim.y * gridDim.z == 1) {
+    // MuseOne19: en cada SM corren un CTA de la primera mitad de la malla y uno de la segunda; el primero tiene la
+    // prioridad de los planificadores de warps y, con partes iguales, el segundo terminaba 8-16 us despues (diag2,
+    // verify 16/32 completa). La primera mitad toma w0/2048 de cada par de partes, la segunda el resto.
+    const int64_t H = G >> 1, w1 = p.w0, w2 = 2048 - p.w0, tot = H * 2048;
+    const int64_t p0 = cpart <= H ? (int64_t)cpart * w1 : H * w1 + ((int64_t)cpart - H) * w2;
+    const int64_t p1 = cpart + 1 <= H ? (int64_t)(cpart + 1) * w1 : H * w1 + ((int64_t)cpart + 1 - H) * w2;
+    cs = (int)(p0 * T / tot);
+    ce = (int)(p1 * T / tot);
   } else {
     cs = (int)((int64_t)cpart * T / G);
     ce = (int)((int64_t)(cpart + 1) * T / G);
@@ -3003,6 +3014,7 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   p.coop = (int)((tma >> 1) & 1);
   const bool pdl = ((tma >> 16) & 1);   // programmatic dependent launch (off by default)
+  p.w0 = (int)((tma >> 20) & 0xFFF);    // MuseOne19: reparto desigual por SM (0: igual)
   if (L == 1) launch<1>(p, grid, stream, (int)cs, pdl);
   else launch<8>(p, grid, stream, (int)cs, pdl);
 }
@@ -3034,6 +3046,10 @@ def _cached(cache, key, make):
         cache[key] = value
     return value
 
+
+# MuseOne19: parte del primer CTA de cada SM en verify completa (/2048; 1024 = igual). vjeux barrio este reparto en
+# H200 con un registro por SM (minimo en 1130-1140); aqui el par se deduce de la mitad de la malla, sin registro.
+W0_L8 = 1135
 
 # Per-shape launch overrides measured on the judge's H200:
 # (batch, q_len, sliding, kv pairs) -> plan fields.
@@ -3200,6 +3216,10 @@ def _launch(data, dbg=None, _mod=None, pdl=None, **override):
     use_pdl = bool(pdl)
     # tma packs the kernel-mode bitfield: bit 1 = cooperative finalize, bit 16 = PDL.
     tma = int(plan.get("tma", 0)) | (coop << COOP_BIT) | (int(use_pdl) << PDL_BIT)
+    # MuseOne19: verify completa con varias peticiones (plano, un par de cabezas kv): la primera mitad de la malla
+    # toma W0_L8/2048 de cada par de partes (en cada SM tiene la prioridad del planificador)
+    w0 = int(plan.get("w0", W0_L8 if (flat and L == 8 and pairs == 1) else 0))
+    tma |= (w0 & 0xFFF) << 20
     if flat or cs <= 1:
         cs, ncl = 0, 1
     ws_acc, ws_l, ws_cnt = _workspace(B * pairs * nc * L * Q_HEADS_PER_PAIR, device)
