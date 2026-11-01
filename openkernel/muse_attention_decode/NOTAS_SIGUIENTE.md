@@ -29,7 +29,14 @@
   - El merge entre CTAs + el cierre cuestan 1.5–3 µs en todas las formas chicas (40–45 % de la ventana con B = 1).
   - Capas completas grandes: 3.7 / 6 µs entre la mediana y el último CTA en terminar el bucle (desbalance).
   - Falta el resto del log (v1f, v16s, v16f, v32s, v32f): se cortó en okc_win.py (arreglado).
-- MuseOne18a: un plan alternativo en 6 formas (ver `_EXPERIMENTO`), las otras 6 de control.
+- MuseOne18a (check `897eea3159f84f2c`, 2.407×): las 6 alternativas perdieron o empataron (kernel, µs):
+  d1s clusters de 8: 8.9 contra 4.5–4.7 (**clusters descartados**); d1f 132 CTAs: 11.6 contra 9.7; d16s
+  cooperativo: 7.9 contra 6.8–7.0; d32s 11 pedazos: 9.0 (igual); v1s 2 copias: 6.1 (igual); v16s 16 pedazos:
+  11.5 contra 10.7. Los planes de vjeux quedan como están.
+- Descartado sin gastar checks: `ex2.approx.f16x2` (en sm_90 MUFU es escalar: no da 2×); exponenciales por
+  polinomio en FMA (vjeux, OKC_EXPPOLY: más lento, el bucle de verify está limitado por emisión).
+- MuseOne19diag (`hacer_diag2.py`): por CTA, SM, segmentos, vueltas, entrada y suma de bucles: tiempo por vuelta
+  decode contra verify y quiénes son los CTAs lentos.
 
 ## Prioridades (de ANALISIS_MuseOne17.md)
 
