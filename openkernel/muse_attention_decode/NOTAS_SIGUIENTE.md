@@ -37,6 +37,14 @@
   polinomio en FMA (vjeux, OKC_EXPPOLY: más lento, el bucle de verify está limitado por emisión).
 - MuseOne19diag (`hacer_diag2.py`): por CTA, SM, segmentos, vueltas, entrada y suma de bucles: tiempo por vuelta
   decode contra verify y quiénes son los CTAs lentos.
+- MuseOne19diag (check `bb21701fa7204838`, 2.611×):
+  - d32f: vuelta 1.02–1.06 µs en todos los CTAs (4.2 TB/s: techo de lectura). Cola de ~5 µs: CTAs con frontera
+    de petición +1.5 µs (SEGK corto), 2º CTA del SM +1.6 µs, 152.25 vueltas promedio → algunos hacen 153.
+  - v1s: vuelta 0.86 µs, pero emitir el merge (2048 red.v4 por CTA, 33 CTAs) tarda 0.9–1.0 µs más; 2 copias no
+    cambiaron nada (18a): el límite es el total de atómicos del L2.
+- MuseOne19: verify con ventana (cierre cooperativo) con una copia privada por split escrita con stores
+  (`st.global.cg.v4`) en vez de `red.v4`; el cierre reparte las copias de cada fila entre G grupos de hilos
+  (v1s: 33 copias, G = 8, ≤ 2 viajes al L2; v16s: 8 copias, G = 2; v32s: 4 copias, camino de antes).
 
 ## Prioridades (de ANALISIS_MuseOne17.md)
 
