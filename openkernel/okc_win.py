@@ -122,11 +122,24 @@ def _resumen(r):
     for rec in res.get("records", []):
         if rec.get("event") == "test":
             print(f"  prueba {rec.get('index'):>2} {rec.get('status'):5s} {rec.get('case')}  {rec.get('message', '')[:300]}")
+        elif rec.get("event") == "benchmark":
+            c = rec.get("case", {})
+            rat = sorted(rec.get("ratios") or [0])
+            otros = {k: v for k, v in rec.items() if k not in ("case", "ratios", "event", "index", "flags")
+                     and not isinstance(v, (list, dict))}
+            print(f"  forma {rec.get('index'):>2} {c.get('load', ''):10s} {c.get('layer', ''):8s} "
+                  f"razon mediana x{rat[len(rat) // 2]:.3f}  {json.dumps(otros, ensure_ascii=False)[:300]}")
+        elif rec.get("event") == "profile":
+            lineas = [" ".join(l.split()) for l in (rec.get("report") or "").splitlines() if "µs" in l]
+            print(f"  perfil {rec.get('index'):>2} " + " | ".join(lineas)[:300])
         else:
             print("  " + json.dumps(rec, ensure_ascii=False)[:800])
-    resto = {k: v for k, v in res.items() if k not in ("records", "machine", "checks", "passed", "error", "flags")}
+    resto = {k: v for k, v in res.items()
+             if k not in ("records", "machine", "checks", "passed", "error", "flags", "log_tail")}
     if resto:
         print(json.dumps(resto, indent=1, ensure_ascii=False)[:4000])
+    if res.get("log_tail"):
+        print("--- lo que imprimio la corrida (final) ---\n" + res["log_tail"])
 
 
 def main(args):

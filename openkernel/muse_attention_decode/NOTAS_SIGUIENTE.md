@@ -14,7 +14,22 @@
   | verify 16 | 10.7 | ≈100 |
   | verify 32 | ≈14 | ≈185 |
 
-- Pendiente: `okc check MuseOne17diag.py` (fases por CTA) para elegir el primer cambio.
+- MuseOne17diag (check `46c38b7ea5c74e54`, 2.597×): fases por CTA (µs desde el primer CTA; mediana/máximo):
+
+  | forma | índices | prólogo | fin del bucle | merge emitido | último CTA | salida |
+  |---|---|---|---|---|---|---|
+  | d1s | 0.6 | 1.1 | 1.6/2.1 | 1.8/2.3 | 3.2 | 3.8 |
+  | d1f | 0.9 | 1.9 | 5.8/6.1 | 6.1/6.4 | 8.1 | 9.1 |
+  | d16s | 0.9 | 2.0 | 3.5/4.2 | 3.8/4.5 | 5.4 | 6.2 |
+  | d32s | 0.9 | 2.2 | 5.4/6.2 | 5.7/6.5 | 7.2 | 8.1 |
+  | v1s | 0.7 | 1.6 | 2.5/3.0 | 3.3/3.8 | 4.8 | 5.5 |
+  | d16f | | | 81.1/84.8 | | 83.6 | 86.6 |
+  | d32f | | | 156.2/162.3 | | 159.7 | 164.2 |
+
+  - El merge entre CTAs + el cierre cuestan 1.5–3 µs en todas las formas chicas (40–45 % de la ventana con B = 1).
+  - Capas completas grandes: 3.7 / 6 µs entre la mediana y el último CTA en terminar el bucle (desbalance).
+  - Falta el resto del log (v1f, v16s, v16f, v32s, v32f): se cortó en okc_win.py (arreglado).
+- MuseOne18a: un plan alternativo en 6 formas (ver `_EXPERIMENTO`), las otras 6 de control.
 
 ## Prioridades (de ANALISIS_MuseOne17.md)
 
